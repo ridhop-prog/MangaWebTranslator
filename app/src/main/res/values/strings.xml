@@ -1,18 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">MangaWebTranslator</string>
-    <string name="btn_go">Buka</string>
-    <string name="default_url">https://rawkuma.com</string>
-    <string name="url_hint">Masukkan URL manga...</string>
+    <string name="app_name">ScreenMangaTranslator</string>
+    <string name="btn_start_service">Mulai Tombol Melayang</string>
+    <string name="btn_stop_service">Hentikan Layanan</string>
+    <string name="lang_label">Bahasa Sumber Teks Komik:</string>
+    <string name="lang_japanese">Jepang (Japanese)</string>
+    <string name="lang_korean">Korea (Hangul)</string>
+    <string name="lang_english">Inggris (English)</string>
+    
+    <string name="perm_overlay_title">Izin Menampilkan di Atas Aplikasi Lain</string>
+    <string name="perm_overlay_desc">Diperlukan agar tombol melayang dan kotak terjemahan dapat muncul di atas aplikasi komik atau browser apa pun.</string>
+    <string name="btn_grant_overlay">Berikan Izin Overlay</string>
+    <string name="overlay_granted">Izin Overlay Aktif ✓</string>
+
+    <string name="status_service_running">Layanan Tombol Melayang Aktif</string>
+    <string name="status_service_stopped">Layanan Tidak Aktif</string>
+    <string name="notification_title">Screen Manga Translator</string>
+    <string name="notification_desc">Layanan tombol melayang sedang berjalan di latar belakang.</string>
+
     <string name="status_capturing">Mengambil tampilan layar…</string>
-    <string name="status_ocr">Mengenali teks…</string>
-    <string name="status_downloading_model">Mengunduh model terjemahan…</string>
-    <string name="status_translating">Menerjemahkan teks…</string>
+    <string name="status_ocr">Mengenali teks komik…</string>
+    <string name="status_downloading_model">Mengunduh kamus terjemahan…</string>
+    <string name="status_translating">Menerjemahkan ke Bahasa Indonesia…</string>
     <string name="status_done">Selesai!</string>
-    <string name="status_no_text">Tidak ada teks yang terdeteksi.</string>
+    <string name="status_no_text">Tidak ada teks terdeteksi di layar.</string>
     <string name="status_failed">Gagal memproses terjemahan.</string>
-    <string name="error_empty_url">URL tidak boleh kosong.</string>
-    <string name="cd_toggle_bar">Sembunyikan atau tampilkan bilah atas</string>
-    <string name="cd_clear">Hapus kotak terjemahan</string>
-    <string name="cd_translate">Pindai dan terjemahkan layar</string>
+
+    <string name="instructions_title">Cara Penggunaan:</string>
+    <string name="instruction_step_1">1. Berikan izin Overlay jika belum aktif.</string>
+    <string name="instruction_step_2">2. Pilih bahasa komik yang ingin diterjemahkan.</string>
+    <string name="instruction_step_3">3. Tekan tombol \"Mulai Tombol Melayang\" dan izinkan rekaman layar.</string>
+    <string name="instruction_step_4">4. Buka aplikasi komik favorit Anda (Tachiyomi, Webtoon, Chrome, dll).</string>
+    <string name="instruction_step_5">5. Ketuk ikon melayang untuk memindai dan menerjemahkan balon teks langsung di layar.</string>
+    <string name="instruction_step_6">6. Ketuk di mana saja pada layar untuk menghapus kotak terjemahan.</string>
 </resources>

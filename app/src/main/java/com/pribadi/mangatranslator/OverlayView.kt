@@ -19,6 +19,7 @@ class OverlayView @JvmOverloads constructor(
 ) : View(context, attrs, defStyleAttr) {
 
     private val blocks = mutableListOf<TranslatedBlock>()
+    var onDismiss: (() -> Unit)? = null
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(245, 255, 255, 255)
@@ -50,8 +51,16 @@ class OverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    fun hasBlocks(): Boolean = blocks.isNotEmpty()
+
     override fun onTouchEvent(event: MotionEvent?): Boolean {
-        // Guarantee touch events always pass through to the underlying WebView
+        if (blocks.isNotEmpty() && onDismiss != null) {
+            if (event?.action == MotionEvent.ACTION_UP) {
+                clear()
+                onDismiss?.invoke()
+            }
+            return true
+        }
         return false
     }
 

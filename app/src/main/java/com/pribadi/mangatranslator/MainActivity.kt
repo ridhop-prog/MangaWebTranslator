@@ -1,330 +1,220 @@
 package com.pribadi.mangatranslator
 
-import android.annotation.SuppressLint
+import android.Manifest
+import android.app.Activity
 import android.content.Context
-import android.content.res.Configuration
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.net.http.SslError
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.webkit.CookieManager
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.ArrayAdapter
 import android.widget.Toast
-import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import com.google.android.gms.tasks.Tasks
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.TranslatorOptions
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.TextRecognizer
-import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import androidx.core.content.ContextCompat
 import com.pribadi.mangatranslator.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private var isTranslating = false
+    private lateinit var prefs: SharedPreferences
+    private lateinit var projectionManager: MediaProjectionManager
+
+    private val PREF_NAME = "ScreenMangaTranslatorPrefs"
+    private val PREF_KEY_LANG = "pref_key_lang_index"
+
+    // Launcher for Screen Capture MediaProjection
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            launchFloatingService(result.resultCode, result.data!!)
+        } else {
+            Toast.makeText(
+                this,
+                "Izin rekam layar diperlukan untuk mendeteksi teks komik.",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    // Launcher for Notification Permission (Android 13+)
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // Notification permission granted or denied
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        setupWebView()
-        setupTopBar()
-        setupFloatingActionButtons()
-        setupBackHandler()
+        prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        projectionManager =
+            getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        // Load initial default URL
-        loadUrlFromInput()
+        setupLanguageSpinner()
+        setupButtons()
+        requestNotificationPermissionIfNeeded()
+
+        // Check overlay permission on start
+        checkOverlayPermissionPrompt()
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        val webSettings: WebSettings = binding.webView.settings
-        webSettings.javaScriptEnabled = true
-        webSettings.domStorageEnabled = true
-        webSettings.databaseEnabled = true
-        webSettings.loadWithOverviewMode = true
-        webSettings.useWideViewPort = true
-        webSettings.builtInZoomControls = true
-        webSettings.displayZoomControls = false
-        webSettings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        webSettings.userAgentString =
-            "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
-        cookieManager.setAcceptThirdPartyCookies(binding.webView, true)
-
-        binding.webView.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                val url = request?.url?.toString()
-                if (url != null) {
-                    view?.loadUrl(url)
-                }
-                return true
-            }
-
-            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                handler?.proceed()
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                super.onPageFinished(view, url)
-                if (!binding.etUrl.hasFocus() && !url.isNullOrEmpty()) {
-                    binding.etUrl.setText(url)
-                }
-            }
-        }
-        binding.webView.webChromeClient = WebChromeClient()
-
-        // Clear overlay when page is scrolled more than 10px
-        binding.webView.setOnScrollChangeListener { _, scrollX, scrollY, oldScrollX, oldScrollY ->
-            if (Math.abs(scrollX - oldScrollX) > 10 || Math.abs(scrollY - oldScrollY) > 10) {
-                binding.overlayView.clear()
-            }
-        }
+    override fun onResume() {
+        super.onResume()
+        updateUIState()
     }
 
-    private fun setupTopBar() {
-        val languages = arrayOf("Jepang", "Korea", "Inggris")
+    private fun setupLanguageSpinner() {
+        val languages = arrayOf(
+            getString(R.string.lang_japanese),
+            getString(R.string.lang_korean),
+            getString(R.string.lang_english)
+        )
         val adapter = ArrayAdapter(this, R.layout.spinner_item, languages)
         adapter.setDropDownViewResource(R.layout.spinner_dropdown_item)
         binding.spinnerLang.adapter = adapter
 
-        binding.btnGo.setOnClickListener {
-            loadUrlFromInput()
-        }
-
-        binding.etUrl.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId == EditorInfo.IME_ACTION_GO || actionId == EditorInfo.IME_ACTION_DONE) {
-                loadUrlFromInput()
-                true
-            } else {
-                false
-            }
-        }
+        val savedLang = prefs.getInt(PREF_KEY_LANG, 0)
+        binding.spinnerLang.setSelection(savedLang)
     }
 
-    private fun setupFloatingActionButtons() {
-        // Toggle top bar visibility for fullscreen reading
-        binding.fabToggleBar.setOnClickListener {
-            binding.topBar.visibility = if (binding.topBar.visibility == View.VISIBLE) {
-                View.GONE
-            } else {
-                View.VISIBLE
-            }
+    private fun setupButtons() {
+        binding.btnGrantOverlay.setOnClickListener {
+            openOverlaySettings()
         }
 
-        // Clear translation overlay
-        binding.fabClear.setOnClickListener {
-            binding.overlayView.clear()
-        }
-
-        // Main translation trigger
-        binding.fabTranslate.setOnClickListener {
-            if (!isTranslating) {
-                processScreenTranslation()
-            } else {
-                Toast.makeText(this, "Sedang menerjemahkan, mohon tunggu...", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
-    private fun setupBackHandler() {
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (binding.webView.canGoBack()) {
-                    binding.overlayView.clear()
-                    binding.webView.goBack()
-                } else {
-                    isEnabled = false
-                    onBackPressedDispatcher.onBackPressed()
-                }
-            }
-        })
-    }
-
-    private fun loadUrlFromInput() {
-        hideKeyboard()
-        val rawUrl = binding.etUrl.text.toString().trim()
-        if (rawUrl.isEmpty()) {
-            Toast.makeText(this, getString(R.string.error_empty_url), Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val targetUrl = if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
-            "https://$rawUrl"
-        } else {
-            rawUrl
-        }
-
-        binding.overlayView.clear()
-        binding.webView.loadUrl(targetUrl)
-    }
-
-    private fun captureWebView(webView: WebView): Bitmap? {
-        if (webView.width <= 0 || webView.height <= 0) return null
-        return try {
-            val bitmap = Bitmap.createBitmap(webView.width, webView.height, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            webView.draw(canvas)
-            bitmap
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun processScreenTranslation() {
-        isTranslating = true
-        showLoading(getString(R.string.status_capturing))
-
-        val bitmap = captureWebView(binding.webView)
-        if (bitmap == null) {
-            hideLoading()
-            isTranslating = false
-            Toast.makeText(this, getString(R.string.status_failed), Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val (recognizer: TextRecognizer, sourceLangCode: String) = when (binding.spinnerLang.selectedItemPosition) {
-            0 -> Pair(
-                TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
-                TranslateLanguage.JAPANESE
-            )
-            1 -> Pair(
-                TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()),
-                TranslateLanguage.KOREAN
-            )
-            else -> Pair(
-                TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
-                TranslateLanguage.ENGLISH
-            )
-        }
-
-        showLoading(getString(R.string.status_ocr))
-        val inputImage = InputImage.fromBitmap(bitmap, 0)
-
-        recognizer.process(inputImage)
-            .addOnSuccessListener { visionText ->
-                // Filter text blocks: size must be >= 15px and contain valid characters
-                val validBlocks = visionText.textBlocks.filter { block ->
-                    val box = block.boundingBox ?: return@filter false
-                    if (box.width() < 15 || box.height() < 15) return@filter false
-                    val cleanText = block.text.replace("\n", " ").trim()
-                    cleanText.any { it.isLetter() }
-                }
-
-                if (validBlocks.isEmpty()) {
-                    hideLoading()
-                    recognizer.close()
-                    isTranslating = false
-                    Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
-                    return@addOnSuccessListener
-                }
-
-                showLoading(getString(R.string.status_downloading_model))
-
-                val translatorOptions = TranslatorOptions.Builder()
-                    .setSourceLanguage(sourceLangCode)
-                    .setTargetLanguage(TranslateLanguage.INDONESIAN)
-                    .build()
-
-                val translator = Translation.getClient(translatorOptions)
-                val conditions = DownloadConditions.Builder().build()
-
-                translator.downloadModelIfNeeded(conditions)
-                    .addOnSuccessListener {
-                        showLoading(getString(R.string.status_translating))
-
-                        val tasks = validBlocks.map { block ->
-                            val cleanText = block.text.replace("\n", " ").trim()
-                            translator.translate(cleanText)
-                        }
-
-                        Tasks.whenAllComplete(tasks)
-                            .addOnCompleteListener {
-                                val results = mutableListOf<TranslatedBlock>()
-                                for (i in validBlocks.indices) {
-                                    val task = tasks[i]
-                                    if (task.isSuccessful) {
-                                        val translated = task.result
-                                        val box = validBlocks[i].boundingBox
-                                        if (!translated.isNullOrBlank() && box != null) {
-                                            results.add(TranslatedBlock(box, translated))
-                                        }
-                                    }
-                                }
-
-                                binding.overlayView.setTranslatedBlocks(results)
-                                hideLoading()
-                                recognizer.close()
-                                translator.close()
-                                isTranslating = false
-                            }
-                    }
-                    .addOnFailureListener { e ->
-                        hideLoading()
-                        recognizer.close()
-                        translator.close()
-                        isTranslating = false
-                        Toast.makeText(
-                            this,
-                            "Gagal mengunduh model: ${e.localizedMessage}",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-            }
-            .addOnFailureListener { e ->
-                hideLoading()
-                recognizer.close()
-                isTranslating = false
+        binding.btnStartFloating.setOnClickListener {
+            if (!hasOverlayPermission()) {
+                openOverlaySettings()
                 Toast.makeText(
                     this,
-                    "Gagal memindai teks: ${e.localizedMessage}",
-                    Toast.LENGTH_SHORT
+                    "Aktifkan izin 'Tampilkan di atas aplikasi lain' terlebih dahulu.",
+                    Toast.LENGTH_LONG
                 ).show()
+                return@setOnClickListener
             }
+
+            // Save selected language
+            val selectedLang = binding.spinnerLang.selectedItemPosition
+            prefs.edit().putInt(PREF_KEY_LANG, selectedLang).apply()
+
+            // Request Screen Capture
+            screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
+        }
+
+        binding.btnStopFloating.setOnClickListener {
+            stopFloatingService()
+        }
     }
 
-    private fun showLoading(message: String) {
-        binding.tvStatus.text = message
-        binding.loadingLayout.visibility = View.VISIBLE
+    private fun hasOverlayPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(this)
+        } else {
+            true
+        }
     }
 
-    private fun hideLoading() {
-        binding.loadingLayout.visibility = View.GONE
+    private fun checkOverlayPermissionPrompt() {
+        if (!hasOverlayPermission()) {
+            Toast.makeText(
+                this,
+                "Mohon berikan izin 'Tampilkan di atas aplikasi lain' untuk menggunakan tombol melayang.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
-    private fun hideKeyboard() {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        val view = currentFocus ?: binding.root
-        imm?.hideSoftInputFromWindow(view.windowToken, 0)
+    private fun openOverlaySettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
+            )
+            startActivity(intent)
+        }
     }
 
-    override fun onConfigurationChanged(newConfig: Configuration) {
-        super.onConfigurationChanged(newConfig)
-        binding.overlayView.clear()
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
     }
 
-    override fun onDestroy() {
-        binding.webView.stopLoading()
-        binding.webView.destroy()
-        super.onDestroy()
+    private fun launchFloatingService(resultCode: Int, resultData: Intent) {
+        val selectedLang = binding.spinnerLang.selectedItemPosition
+        val serviceIntent = Intent(this, FloatingService::class.java).apply {
+            putExtra(FloatingService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(FloatingService.EXTRA_RESULT_DATA, resultData)
+            putExtra(FloatingService.EXTRA_LANG_INDEX, selectedLang)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ContextCompat.startForegroundService(this, serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+
+        Toast.makeText(
+            this,
+            "Tombol melayang aktif! Buka aplikasi komik favorit Anda.",
+            Toast.LENGTH_LONG
+        ).show()
+
+        updateUIState()
+
+        // Move to background so user can go read comics immediately
+        moveTaskToBack(true)
+    }
+
+    private fun stopFloatingService() {
+        val stopIntent = Intent(this, FloatingService::class.java).apply {
+            action = FloatingService.ACTION_STOP
+        }
+        startService(stopIntent)
+
+        Toast.makeText(this, "Layanan tombol melayang telah dihentikan.", Toast.LENGTH_SHORT).show()
+        updateUIState()
+    }
+
+    private fun updateUIState() {
+        val overlayGranted = hasOverlayPermission()
+        if (overlayGranted) {
+            binding.tvOverlayStatus.text = getString(R.string.overlay_granted)
+            binding.tvOverlayStatus.setTextColor(Color.parseColor("#4CAF50"))
+            binding.btnGrantOverlay.visibility = View.GONE
+        } else {
+            binding.tvOverlayStatus.text = "Izin Overlay Belum Aktif ⚠"
+            binding.tvOverlayStatus.setTextColor(Color.parseColor("#FF5252"))
+            binding.btnGrantOverlay.visibility = View.VISIBLE
+        }
+
+        val serviceRunning = FloatingService.isRunning
+        if (serviceRunning) {
+            binding.tvServiceStatus.text = getString(R.string.status_service_running)
+            binding.tvServiceStatus.setTextColor(Color.parseColor("#4CAF50"))
+            binding.btnStartFloating.text = "Layanan Sedang Berjalan (Ketuk untuk Refresh)"
+            binding.btnStopFloating.visibility = View.VISIBLE
+        } else {
+            binding.tvServiceStatus.text = getString(R.string.status_service_stopped)
+            binding.tvServiceStatus.setTextColor(Color.parseColor("#FF7043"))
+            binding.btnStartFloating.text = getString(R.string.btn_start_service)
+            binding.btnStopFloating.visibility = View.GONE
+        }
     }
 }
