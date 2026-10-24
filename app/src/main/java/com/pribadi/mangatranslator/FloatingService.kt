@@ -99,7 +99,7 @@ class FloatingService : Service() {
             intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
             @Suppress("DEPRECATION")
-            intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+            intent?.getParcelableExtra(EXTRA_RESULT_DATA) as? Intent
         }
 
         // 1. Mandatory order on Android 14: Start foreground service FIRST

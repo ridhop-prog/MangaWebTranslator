@@ -33,4 +33,6 @@
     <string name="instruction_step_4">4. Buka aplikasi komik favorit Anda (Tachiyomi, Webtoon, Chrome, dll).</string>
     <string name="instruction_step_5">5. Ketuk ikon melayang untuk memindai dan menerjemahkan balon teks langsung di layar.</string>
     <string name="instruction_step_6">6. Ketuk di mana saja pada layar untuk menghapus kotak terjemahan.</string>
+    <string name="cd_translate">Pindai dan terjemahkan layar</string>
+    <string name="cd_clear">Tutup tombol melayang</string>
 </resources>
