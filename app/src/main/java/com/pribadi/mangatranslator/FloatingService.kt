@@ -95,11 +95,11 @@ class FloatingService : Service() {
 
         currentLangIndex = intent?.getIntExtra(EXTRA_LANG_INDEX, 0) ?: 0
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
-        val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
         } else {
             @Suppress("DEPRECATION")
-            intent?.getParcelableExtra(EXTRA_RESULT_DATA)
+            intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         }
 
         // 1. Mandatory order on Android 14: Start foreground service FIRST
@@ -427,7 +427,7 @@ class FloatingService : Service() {
                                 for (i in validBlocks.indices) {
                                     val task = tasks[i]
                                     if (task.isSuccessful) {
-                                        val translated = task.result
+                                        val translated = task.result as? String
                                         val box = validBlocks[i].boundingBox
                                         if (!translated.isNullOrBlank() && box != null) {
                                             results.add(TranslatedBlock(box, translated))
