@@ -11,6 +11,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -66,6 +67,17 @@ class FloatingService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var currentLangIndex = 0 // 0: Japanese, 1: Korean, 2: English
     private var isTranslating = false
+
+    // Auto-Translate / Continuous Scroll Engine
+    private var isAutoMode = false
+    private var lastScreenSamples: IntArray? = null
+    private val autoTranslateRunnable = object : Runnable {
+        override fun run() {
+            if (!isAutoMode || !isRunning) return
+            performAutoTranslateCheck()
+            handler.postDelayed(this, 2000)
+        }
+    }
 
     // Persistent Screen Capture Engine
     private var virtualDisplay: VirtualDisplay? = null
@@ -219,6 +231,7 @@ class FloatingService : Service() {
         }
 
         val btnMain = floatingBubbleView?.findViewById<FrameLayout>(R.id.btnFloatingMain)
+        val btnToggleAuto = floatingBubbleView?.findViewById<FrameLayout>(R.id.btnToggleAuto)
         val tvLangBadge = floatingBubbleView?.findViewById<TextView>(R.id.tvLangBadge)
         val btnClose = floatingBubbleView?.findViewById<ImageView>(R.id.btnCloseFloating)
         val pbLoading = floatingBubbleView?.findViewById<ProgressBar>(R.id.pbLoading)
@@ -232,6 +245,12 @@ class FloatingService : Service() {
             }
         }
         updateBadge()
+        updateAutoModeUI()
+
+        // Toggle Auto-Translate mode on pill click
+        btnToggleAuto?.setOnClickListener {
+            toggleAutoMode()
+        }
 
         // Language cycle on badge tap
         tvLangBadge?.setOnClickListener {
@@ -336,8 +355,146 @@ class FloatingService : Service() {
         }
     }
 
+    private fun toggleAutoMode() {
+        val ivIcon = floatingBubbleView?.findViewById<ImageView>(R.id.ivIcon)
+        val pbLoading = floatingBubbleView?.findViewById<ProgressBar>(R.id.pbLoading)
+
+        isAutoMode = !isAutoMode
+        updateAutoModeUI()
+
+        if (isAutoMode) {
+            lastScreenSamples = null
+            handler.removeCallbacks(autoTranslateRunnable)
+            handler.post(autoTranslateRunnable)
+            Toast.makeText(
+                this,
+                "Mode Auto AKTIF: Komik diterjemahkan otomatis saat membaca",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else {
+            handler.removeCallbacks(autoTranslateRunnable)
+            hideOverlay()
+            Toast.makeText(this, "Mode Auto NONAKTIF", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun updateAutoModeUI() {
+        val btnMain = floatingBubbleView?.findViewById<FrameLayout>(R.id.btnFloatingMain)
+        val btnAuto = floatingBubbleView?.findViewById<FrameLayout>(R.id.btnToggleAuto)
+        val tvAutoText = floatingBubbleView?.findViewById<TextView>(R.id.tvAutoText)
+        val viewAutoDot = floatingBubbleView?.findViewById<View>(R.id.viewAutoDot)
+
+        if (isAutoMode) {
+            btnMain?.setBackgroundResource(R.drawable.bg_floating_bubble_auto)
+            btnAuto?.setBackgroundResource(R.drawable.bg_auto_toggle_on)
+            viewAutoDot?.setBackgroundResource(R.drawable.bg_auto_dot_on)
+            tvAutoText?.text = "AUTO ON"
+        } else {
+            btnMain?.setBackgroundResource(R.drawable.bg_floating_bubble)
+            btnAuto?.setBackgroundResource(R.drawable.bg_auto_toggle_off)
+            viewAutoDot?.setBackgroundResource(R.drawable.bg_auto_dot_off)
+            tvAutoText?.text = "AUTO"
+        }
+    }
+
+    private fun performAutoTranslateCheck() {
+        if (isTranslating || mediaProjection == null || virtualDisplay == null) return
+
+        var currentBmp: Bitmap? = null
+        synchronized(bitmapLock) {
+            val bmp = latestBitmap
+            if (bmp != null && !bmp.isRecycled) {
+                currentBmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
+            }
+        }
+
+        if (currentBmp == null) return
+
+        // Compare with previous screen samples to avoid re-translating static screen
+        if (!hasScreenChangedSignificantly(currentBmp, lastScreenSamples)) {
+            return
+        }
+
+        lastScreenSamples = extractScreenSamples(currentBmp)
+
+        val ivIcon = floatingBubbleView?.findViewById<ImageView>(R.id.ivIcon)
+        val pbLoading = floatingBubbleView?.findViewById<ProgressBar>(R.id.pbLoading)
+
+        isTranslating = true
+        ivIcon?.visibility = View.GONE
+        pbLoading?.visibility = View.VISIBLE
+
+        processBitmapTranslation(currentBmp, ivIcon, pbLoading, isAuto = true)
+    }
+
+    private fun hasScreenChangedSignificantly(current: Bitmap, referenceSamples: IntArray?): Boolean {
+        if (referenceSamples == null) return true
+        val width = current.width
+        val height = current.height
+        if (width < 50 || height < 50) return true
+
+        var diffCount = 0
+        var sampleIdx = 0
+
+        val startX = (width * 0.15).toInt()
+        val endX = (width * 0.85).toInt()
+        val startY = (height * 0.15).toInt()
+        val endY = (height * 0.85).toInt()
+        val stepX = maxOf(1, (endX - startX) / 10)
+        val stepY = maxOf(1, (endY - startY) / 10)
+
+        for (y in startY until endY step stepY) {
+            for (x in startX until endX step stepX) {
+                if (sampleIdx >= referenceSamples.size) break
+                val curPixel = current.getPixel(x, y)
+                val refPixel = referenceSamples[sampleIdx]
+                if (curPixel != refPixel) {
+                    diffCount++
+                }
+                sampleIdx++
+            }
+        }
+
+        // If more than 8% of sampled pixels changed, the screen has moved
+        return diffCount > 8
+    }
+
+    private fun extractScreenSamples(bitmap: Bitmap): IntArray {
+        val samples = IntArray(100)
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width < 50 || height < 50) return samples
+
+        val startX = (width * 0.15).toInt()
+        val endX = (width * 0.85).toInt()
+        val startY = (height * 0.15).toInt()
+        val endY = (height * 0.85).toInt()
+        val stepX = maxOf(1, (endX - startX) / 10)
+        val stepY = maxOf(1, (endY - startY) / 10)
+        var idx = 0
+
+        for (y in startY until endY step stepY) {
+            for (x in startX until endX step stepX) {
+                if (idx >= samples.size) break
+                samples[idx++] = bitmap.getPixel(x, y)
+            }
+        }
+        return samples
+    }
+
     private fun showOverlay(blocks: List<TranslatedBlock>) {
-        if (!isOverlayAttached && overlayView != null) {
+        val flags = if (isAutoMode) {
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+
+        overlayParams?.flags = flags
+
+        if (isOverlayAttached && overlayView != null) {
+            windowManager.updateViewLayout(overlayView, overlayParams)
+        } else if (!isOverlayAttached && overlayView != null) {
             windowManager.addView(overlayView, overlayParams)
             isOverlayAttached = true
         }
@@ -458,16 +615,19 @@ class FloatingService : Service() {
                 return@captureScreen
             }
 
-            processBitmapTranslation(bitmap, ivIcon, pbLoading)
+            processBitmapTranslation(bitmap, ivIcon, pbLoading, isAuto = false)
         }
     }
 
     private fun processBitmapTranslation(
         bitmap: Bitmap,
         ivIcon: ImageView?,
-        pbLoading: ProgressBar?
+        pbLoading: ProgressBar?,
+        isAuto: Boolean = false
     ) {
-        showStatus(getString(R.string.status_ocr))
+        if (!isAuto) {
+            showStatus(getString(R.string.status_ocr))
+        }
 
         val (recognizer: TextRecognizer, defaultSourceLang: String) = when (currentLangIndex) {
             0 -> Pair(
@@ -487,9 +647,20 @@ class FloatingService : Service() {
         val inputImage = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
+                val bubbleRect = Rect()
+                val bParams = bubbleParams
+                if (floatingBubbleView != null && bParams != null) {
+                    val bX = bParams.x
+                    val bY = bParams.y
+                    val bW = floatingBubbleView?.width ?: 0
+                    val bH = floatingBubbleView?.height ?: 0
+                    bubbleRect.set(bX - 20, bY - 20, bX + bW + 20, bY + bH + 20)
+                }
+
                 val validBlocks = visionText.textBlocks.filter { block ->
                     val box = block.boundingBox ?: return@filter false
                     if (box.width() < 12 || box.height() < 12) return@filter false
+                    if (Rect.intersects(box, bubbleRect)) return@filter false
                     val cleanText = block.text.replace("\n", " ").trim()
                     cleanText.any { it.isLetter() }
                 }
@@ -497,7 +668,11 @@ class FloatingService : Service() {
                 if (validBlocks.isEmpty()) {
                     finishTranslation(ivIcon, pbLoading)
                     recognizer.close()
-                    Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
+                    if (isAuto) {
+                        hideOverlay()
+                    } else {
+                        Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
+                    }
                     return@addOnSuccessListener
                 }
 
@@ -539,7 +714,9 @@ class FloatingService : Service() {
                     }
                 }
 
-                showStatus(getString(R.string.status_downloading_model))
+                if (!isAuto) {
+                    showStatus(getString(R.string.status_downloading_model))
+                }
 
                 val translatorOptions = TranslatorOptions.Builder()
                     .setSourceLanguage(sourceLangCode)
@@ -551,7 +728,9 @@ class FloatingService : Service() {
 
                 translator.downloadModelIfNeeded(conditions)
                     .addOnSuccessListener {
-                        showStatus(getString(R.string.status_translating))
+                        if (!isAuto) {
+                            showStatus(getString(R.string.status_translating))
+                        }
 
                         val tasks = validBlocks.map { block ->
                             val cleanText = block.text.replace("\n", " ").trim()
@@ -578,13 +757,19 @@ class FloatingService : Service() {
 
                                 if (results.isNotEmpty()) {
                                     showOverlay(results)
-                                    Toast.makeText(
-                                        this,
-                                        "Terjemahan siap (${results.size} balon teks). Ketuk layar untuk menutup.",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
+                                    if (!isAuto) {
+                                        Toast.makeText(
+                                            this,
+                                            "Terjemahan siap (${results.size} balon teks). Ketuk layar untuk menutup.",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
                                 } else {
-                                    Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
+                                    if (isAuto) {
+                                        hideOverlay()
+                                    } else {
+                                        Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                             }
                     }
@@ -592,13 +777,17 @@ class FloatingService : Service() {
                         finishTranslation(ivIcon, pbLoading)
                         recognizer.close()
                         translator.close()
-                        Toast.makeText(this, "Gagal mengunduh kamus: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                        if (!isAuto) {
+                            Toast.makeText(this, "Gagal mengunduh kamus: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                        }
                     }
             }
             .addOnFailureListener { e ->
                 finishTranslation(ivIcon, pbLoading)
                 recognizer.close()
-                Toast.makeText(this, "Gagal memindai: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                if (!isAuto) {
+                    Toast.makeText(this, "Gagal memindai: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
             }
     }
 
@@ -655,6 +844,8 @@ class FloatingService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        isAutoMode = false
+        handler.removeCallbacks(autoTranslateRunnable)
         hideOverlay()
         hideStatus()
 
