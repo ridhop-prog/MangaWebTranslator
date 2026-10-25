@@ -18,6 +18,10 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.TranslatorOptions
 import com.pribadi.mangatranslator.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
@@ -107,12 +111,39 @@ class MainActivity : AppCompatActivity() {
             val selectedLang = binding.spinnerLang.selectedItemPosition
             prefs.edit().putInt(PREF_KEY_LANG, selectedLang).apply()
 
+            // Pre-download translator models in background so they are ready
+            preDownloadLanguageModel(selectedLang)
+
             // Request Screen Capture
             screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
 
         binding.btnStopFloating.setOnClickListener {
             stopFloatingService()
+        }
+    }
+
+    private fun preDownloadLanguageModel(langIndex: Int) {
+        val languagesToPreload = listOf(
+            TranslateLanguage.ENGLISH, // Always ensure English is ready (most popular for web scans)
+            when (langIndex) {
+                0 -> TranslateLanguage.JAPANESE
+                1 -> TranslateLanguage.KOREAN
+                else -> TranslateLanguage.ENGLISH
+            }
+        ).distinct()
+
+        for (sourceLang in languagesToPreload) {
+            val options = TranslatorOptions.Builder()
+                .setSourceLanguage(sourceLang)
+                .setTargetLanguage(TranslateLanguage.INDONESIAN)
+                .build()
+            val client = Translation.getClient(options)
+            val conditions = DownloadConditions.Builder().build()
+            client.downloadModelIfNeeded(conditions)
+                .addOnCompleteListener {
+                    client.close()
+                }
         }
     }
 

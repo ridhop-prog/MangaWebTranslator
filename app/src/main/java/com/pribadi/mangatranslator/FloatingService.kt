@@ -19,6 +19,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
@@ -65,6 +66,17 @@ class FloatingService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var currentLangIndex = 0 // 0: Japanese, 1: Korean, 2: English
     private var isTranslating = false
+
+    // Persistent Screen Capture Engine
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+    private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
+    private var latestBitmap: Bitmap? = null
+    private val bitmapLock = Any()
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var captureDpi = 0
 
     // Views
     private var floatingBubbleView: View? = null
@@ -124,8 +136,11 @@ class FloatingService : Service() {
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     mediaProjection = null
+                    stopScreenCapture()
                 }
             }, handler)
+
+            initScreenCapture()
         }
 
         // 3. Initialize and show floating bubble
@@ -337,6 +352,92 @@ class FloatingService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun initScreenCapture() {
+        val mp = mediaProjection ?: return
+        if (virtualDisplay != null) return
+
+        val metrics = DisplayMetrics()
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        captureWidth = metrics.widthPixels
+        captureHeight = metrics.heightPixels
+        captureDpi = metrics.densityDpi
+
+        val thread = HandlerThread("ScreenCaptureThread").apply { start() }
+        captureThread = thread
+        val bgHandler = Handler(thread.looper)
+        captureHandler = bgHandler
+
+        val reader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 3)
+        imageReader = reader
+
+        reader.setOnImageAvailableListener({ r ->
+            var image: Image? = null
+            try {
+                image = r.acquireLatestImage()
+                if (image != null) {
+                    val planes = image.planes
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * captureWidth
+
+                    val bmp = Bitmap.createBitmap(
+                        captureWidth + rowPadding / pixelStride,
+                        captureHeight,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    bmp.copyPixelsFromBuffer(buffer)
+
+                    val finalBmp = if (rowPadding == 0) {
+                        bmp
+                    } else {
+                        val cropped = Bitmap.createBitmap(bmp, 0, 0, captureWidth, captureHeight)
+                        bmp.recycle()
+                        cropped
+                    }
+
+                    synchronized(bitmapLock) {
+                        latestBitmap?.recycle()
+                        latestBitmap = finalBmp
+                    }
+                }
+            } catch (e: Exception) {
+                // ignore image read exceptions
+            } finally {
+                image?.close()
+            }
+        }, bgHandler)
+
+        virtualDisplay = mp.createVirtualDisplay(
+            "ScreenMangaCapture",
+            captureWidth,
+            captureHeight,
+            captureDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader.surface,
+            null,
+            bgHandler
+        )
+    }
+
+    private fun stopScreenCapture() {
+        try {
+            virtualDisplay?.release()
+            virtualDisplay = null
+            imageReader?.close()
+            imageReader = null
+            captureThread?.quitSafely()
+            captureThread = null
+            synchronized(bitmapLock) {
+                latestBitmap?.recycle()
+                latestBitmap = null
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private fun startScreenTranslation(ivIcon: ImageView?, pbLoading: ProgressBar?) {
         isTranslating = true
         ivIcon?.visibility = View.GONE
@@ -345,22 +446,20 @@ class FloatingService : Service() {
         hideOverlay()
         showStatus(getString(R.string.status_capturing))
 
-        // Temporarily hide bubble for clean screenshot capture
+        // Temporarily hide bubble so SurfaceFlinger sends a fresh frame without the bubble
         floatingBubbleView?.visibility = View.INVISIBLE
 
-        handler.postDelayed({
-            captureScreen { bitmap ->
-                floatingBubbleView?.visibility = View.VISIBLE
+        captureScreen { bitmap ->
+            floatingBubbleView?.visibility = View.VISIBLE
 
-                if (bitmap == null) {
-                    finishTranslation(ivIcon, pbLoading)
-                    Toast.makeText(this, getString(R.string.status_failed), Toast.LENGTH_SHORT).show()
-                    return@captureScreen
-                }
-
-                processBitmapTranslation(bitmap, ivIcon, pbLoading)
+            if (bitmap == null) {
+                finishTranslation(ivIcon, pbLoading)
+                Toast.makeText(this, getString(R.string.status_failed), Toast.LENGTH_SHORT).show()
+                return@captureScreen
             }
-        }, 120)
+
+            processBitmapTranslation(bitmap, ivIcon, pbLoading)
+        }
     }
 
     private fun processBitmapTranslation(
@@ -370,7 +469,7 @@ class FloatingService : Service() {
     ) {
         showStatus(getString(R.string.status_ocr))
 
-        val (recognizer: TextRecognizer, sourceLangCode: String) = when (currentLangIndex) {
+        val (recognizer: TextRecognizer, defaultSourceLang: String) = when (currentLangIndex) {
             0 -> Pair(
                 TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
                 TranslateLanguage.JAPANESE
@@ -390,7 +489,7 @@ class FloatingService : Service() {
             .addOnSuccessListener { visionText ->
                 val validBlocks = visionText.textBlocks.filter { block ->
                     val box = block.boundingBox ?: return@filter false
-                    if (box.width() < 15 || box.height() < 15) return@filter false
+                    if (box.width() < 12 || box.height() < 12) return@filter false
                     val cleanText = block.text.replace("\n", " ").trim()
                     cleanText.any { it.isLetter() }
                 }
@@ -400,6 +499,44 @@ class FloatingService : Service() {
                     recognizer.close()
                     Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
                     return@addOnSuccessListener
+                }
+
+                // Smart Language Auto-Detection:
+                // Scan detected text characters to detect English vs Japanese vs Korean
+                val allText = validBlocks.joinToString(" ") { it.text }
+                val hasJapanese = allText.any { c ->
+                    (c in '\u3040'..'\u309F') || // Hiragana
+                    (c in '\u30A0'..'\u30FF') || // Katakana
+                    (c in '\u4E00'..'\u9FAF')    // Kanji
+                }
+                val hasKorean = allText.any { c ->
+                    (c in '\uAC00'..'\uD7AF') || // Hangul Syllables
+                    (c in '\u1100'..'\u11FF') || // Hangul Jamo
+                    (c in '\u3130'..'\u318F')    // Hangul Compatibility Jamo
+                }
+                val hasLatin = allText.any { c -> (c in 'a'..'z') || (c in 'A'..'Z') }
+
+                val sourceLangCode = when {
+                    hasJapanese -> TranslateLanguage.JAPANESE
+                    hasKorean -> TranslateLanguage.KOREAN
+                    hasLatin -> TranslateLanguage.ENGLISH
+                    else -> defaultSourceLang
+                }
+
+                // If language was auto-detected differently from current badge, update badge
+                val detectedIndex = when (sourceLangCode) {
+                    TranslateLanguage.JAPANESE -> 0
+                    TranslateLanguage.KOREAN -> 1
+                    else -> 2
+                }
+                if (detectedIndex != currentLangIndex) {
+                    currentLangIndex = detectedIndex
+                    val tvLangBadge = floatingBubbleView?.findViewById<TextView>(R.id.tvLangBadge)
+                    tvLangBadge?.text = when (currentLangIndex) {
+                        0 -> "JA"
+                        1 -> "KO"
+                        else -> "EN"
+                    }
                 }
 
                 showStatus(getString(R.string.status_downloading_model))
@@ -443,7 +580,7 @@ class FloatingService : Service() {
                                     showOverlay(results)
                                     Toast.makeText(
                                         this,
-                                        "Terjemahan siap. Ketuk layar untuk menutup.",
+                                        "Terjemahan siap (${results.size} balon teks). Ketuk layar untuk menutup.",
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 } else {
@@ -480,81 +617,40 @@ class FloatingService : Service() {
             return
         }
 
+        if (virtualDisplay == null) {
+            initScreenCapture()
+        }
+
+        // Check if screen orientation changed
         val metrics = DisplayMetrics()
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val dpi = metrics.densityDpi
+        if (metrics.widthPixels != captureWidth || metrics.heightPixels != captureHeight) {
+            stopScreenCapture()
+            initScreenCapture()
+        }
 
-        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        var virtualDisplay: VirtualDisplay? = null
-        var isCaptured = false
-
-        imageReader.setOnImageAvailableListener({ reader ->
-            if (isCaptured) return@setOnImageAvailableListener
-            var image: Image? = null
-            try {
-                image = reader.acquireLatestImage()
-                if (image != null) {
-                    isCaptured = true
-                    val planes = image.planes
-                    val buffer = planes[0].buffer
-                    val pixelStride = planes[0].pixelStride
-                    val rowStride = planes[0].rowStride
-                    val rowPadding = rowStride - pixelStride * width
-
-                    val bitmap = Bitmap.createBitmap(
-                        width + rowPadding / pixelStride,
-                        height,
-                        Bitmap.Config.ARGB_8888
-                    )
-                    bitmap.copyPixelsFromBuffer(buffer)
-
-                    val finalBitmap = if (rowPadding == 0) {
-                        bitmap
-                    } else {
-                        val cropped = Bitmap.createBitmap(bitmap, 0, 0, width, height)
-                        bitmap.recycle()
-                        cropped
-                    }
-
-                    handler.post {
-                        virtualDisplay?.release()
-                        imageReader.close()
-                        callback(finalBitmap)
-                    }
+        var attempts = 0
+        fun checkFrame() {
+            var resultBitmap: Bitmap? = null
+            synchronized(bitmapLock) {
+                val bmp = latestBitmap
+                if (bmp != null && !bmp.isRecycled) {
+                    resultBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
                 }
-            } catch (e: Exception) {
-                handler.post {
-                    virtualDisplay?.release()
-                    imageReader.close()
-                    callback(null)
-                }
-            } finally {
-                image?.close()
             }
-        }, handler)
 
-        virtualDisplay = mp.createVirtualDisplay(
-            "ScreenMangaCapture",
-            width,
-            height,
-            dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader.surface,
-            null,
-            handler
-        )
-
-        // Failsafe timeout in case device delays image generation
-        handler.postDelayed({
-            if (!isCaptured) {
-                isCaptured = true
-                virtualDisplay?.release()
-                imageReader.close()
+            if (resultBitmap != null) {
+                callback(resultBitmap)
+            } else if (attempts < 6) {
+                attempts++
+                handler.postDelayed({ checkFrame() }, 60)
+            } else {
                 callback(null)
             }
-        }, 2000)
+        }
+
+        // Wait 90ms for SurfaceFlinger to send the fresh frame without the floating bubble
+        handler.postDelayed({ checkFrame() }, 90)
     }
 
     override fun onDestroy() {
@@ -566,6 +662,8 @@ class FloatingService : Service() {
             windowManager.removeView(floatingBubbleView)
             floatingBubbleView = null
         }
+
+        stopScreenCapture()
 
         mediaProjection?.stop()
         mediaProjection = null
