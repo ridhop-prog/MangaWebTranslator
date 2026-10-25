@@ -56,6 +56,7 @@ class FloatingService : Service() {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_LANG_INDEX = "extra_lang_index"
+        const val EXTRA_BG_STYLE = "extra_bg_style"
         const val ACTION_STOP = "action_stop_floating_service"
         var isRunning = false
             private set
@@ -66,6 +67,7 @@ class FloatingService : Service() {
 
     private var mediaProjection: MediaProjection? = null
     private var currentLangIndex = 0 // 0: Japanese, 1: Korean, 2: English
+    private var bgStyle = OverlayView.STYLE_TRANSPARENT
     private var isTranslating = false
 
     // Auto-Translate / Continuous Scroll Engine
@@ -118,6 +120,13 @@ class FloatingService : Service() {
         }
 
         currentLangIndex = intent?.getIntExtra(EXTRA_LANG_INDEX, 0) ?: 0
+        bgStyle = intent?.getIntExtra(
+            EXTRA_BG_STYLE,
+            getSharedPreferences("ScreenMangaTranslatorPrefs", Context.MODE_PRIVATE)
+                .getInt("pref_key_bg_style", OverlayView.STYLE_TRANSPARENT)
+        ) ?: OverlayView.STYLE_TRANSPARENT
+        overlayView?.bgStyle = bgStyle
+
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
         val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
@@ -325,6 +334,8 @@ class FloatingService : Service() {
 
         // Setup Fullscreen OverlayView
         overlayView = OverlayView(this).apply {
+            val prefs = getSharedPreferences("ScreenMangaTranslatorPrefs", Context.MODE_PRIVATE)
+            bgStyle = prefs.getInt("pref_key_bg_style", OverlayView.STYLE_TRANSPARENT)
             onDismiss = {
                 hideOverlay()
             }
@@ -658,10 +669,34 @@ class FloatingService : Service() {
 
                 val validBlocks = visionText.textBlocks.filter { block ->
                     val box = block.boundingBox ?: return@filter false
-                    if (box.width() < 12 || box.height() < 12) return@filter false
+                    if (box.width() < 14 || box.height() < 14) return@filter false
+
+                    // 1. Exclude Android system status bar (top ~5%)
+                    if (box.top < captureHeight * 0.052f) return@filter false
+
+                    // 2. Exclude Android system navigation & browser address bar (bottom ~7%)
+                    if (box.bottom > captureHeight * 0.935f) return@filter false
+
+                    // 3. Exclude Floating bubble UI itself
                     if (Rect.intersects(box, bubbleRect)) return@filter false
+
                     val cleanText = block.text.replace("\n", " ").trim()
-                    cleanText.any { it.isLetter() }
+                    val letterCount = cleanText.count { it.isLetter() }
+                    if (letterCount < 2) return@filter false
+
+                    // 4. Exclude Web URLs & domain names
+                    if (isWebUrlOrDomain(cleanText)) return@filter false
+
+                    // 5. Exclude Web search dates & timestamps
+                    if (isDateOrTimestamp(cleanText)) return@filter false
+
+                    // 6. Exclude extreme full-width article / search description paragraphs (>85% screen width)
+                    if (box.width() > captureWidth * 0.85f && cleanText.length > 50) return@filter false
+
+                    // 7. Exclude Search Engine UI chips near top (upper 20% of screen)
+                    if (box.top < captureHeight * 0.20f && isSearchNavigationChip(cleanText)) return@filter false
+
+                    true
                 }
 
                 if (validBlocks.isEmpty()) {
@@ -673,6 +708,13 @@ class FloatingService : Service() {
                         Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
                     }
                     return@addOnSuccessListener
+                }
+
+                // Detect comic speech bubble bounds for each valid text block
+                val bubbleBoxes = validBlocks.map { block ->
+                    block.boundingBox?.let { box ->
+                        SpeechBubbleDetector.detectBubbleBounds(bitmap, box)
+                    }
                 }
 
                 // Smart Language Auto-Detection:
@@ -744,8 +786,9 @@ class FloatingService : Service() {
                                     if (task.isSuccessful) {
                                         val translated = task.result as? String
                                         val box = validBlocks[i].boundingBox
+                                        val bubble = bubbleBoxes.getOrNull(i)
                                         if (!translated.isNullOrBlank() && box != null) {
-                                            results.add(TranslatedBlock(box, translated))
+                                            results.add(TranslatedBlock(box, translated, bubble))
                                         }
                                     }
                                 }
@@ -839,6 +882,40 @@ class FloatingService : Service() {
 
         // Wait 90ms for SurfaceFlinger to send the fresh frame without the floating bubble
         handler.postDelayed({ checkFrame() }, 90)
+    }
+
+    private fun isWebUrlOrDomain(text: String): Boolean {
+        val lower = text.lowercase()
+        return lower.contains("http://") ||
+                lower.contains("https://") ||
+                lower.contains(".com") ||
+                lower.contains(".net") ||
+                lower.contains(".org") ||
+                lower.contains(".co.") ||
+                lower.contains("www.") ||
+                lower.contains(".html") ||
+                lower.contains(".php") ||
+                lower.contains("webtoons") ||
+                lower.contains("scan")
+    }
+
+    private val dateTimestampRegex = Regex(
+        """\b\d{1,2}\s+(Jan|Feb|Mar|Apr|Mei|May|Jun|Jul|Agu|Aug|Sep|Okt|Oct|Nov|Des|Dec)\b|\b\d{1,2}:\d{2}\b""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun isDateOrTimestamp(text: String): Boolean {
+        return dateTimestampRegex.containsMatchIn(text)
+    }
+
+    private fun isSearchNavigationChip(text: String): Boolean {
+        val lower = text.lowercase().trim()
+        val chips = setOf(
+            "semua", "gambar", "video", "belanja", "berita", "news",
+            "maps", "shopping", "terjemahkan", "google", "mode", "pail",
+            "catur", "capcut", "video singkat", "alat", "telusuri", "search"
+        )
+        return lower in chips
     }
 
     override fun onDestroy() {

@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
@@ -18,27 +19,38 @@ class OverlayView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
+    companion object {
+        const val STYLE_TRANSPARENT = 0     // No background card, comic outline halo
+        const val STYLE_SEAMLESS_WHITE = 1   // Seamless white bubble patch (no border)
+    }
+
     private val blocks = mutableListOf<TranslatedBlock>()
     var onDismiss: (() -> Unit)? = null
+    var bgStyle: Int = STYLE_TRANSPARENT
 
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(245, 255, 255, 255)
-        style = Paint.Style.FILL
-    }
-
-    private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.BLACK
+    // White outline stroke paint for high legibility over comic art
+    private val textStrokePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
         style = Paint.Style.STROKE
-        strokeWidth = 1.5f
-    }
-
-    private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.BLACK
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         isAntiAlias = true
     }
 
-    private val padding = 4f
-    private val cornerRadius = 8f
+    // Bold black comic dialogue text paint
+    private val textFillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK
+        style = Paint.Style.FILL
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        isAntiAlias = true
+    }
+
+    // Seamless white paint for erasing old text inside light bubbles (without any black border)
+    private val seamlessWhitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.FILL
+    }
 
     fun setTranslatedBlocks(newBlocks: List<TranslatedBlock>) {
         blocks.clear()
@@ -69,34 +81,38 @@ class OverlayView @JvmOverloads constructor(
 
         if (blocks.isEmpty()) return
 
+        val screenWidth = width.toFloat()
+        val screenHeight = height.toFloat()
+
         for (block in blocks) {
-            val box = block.boundingBox
             val text = block.translatedText.trim()
             if (text.isEmpty()) continue
 
-            val initialRectF = RectF(
-                box.left.toFloat() - padding,
-                box.top.toFloat() - padding,
-                box.right.toFloat() + padding,
-                box.bottom.toFloat() + padding
-            )
+            // Use the detected speech bubble box if available, otherwise fallback to bounding box
+            val box = block.bubbleBox ?: block.boundingBox
 
-            val availableWidth = (initialRectF.width() - (padding * 2)).toInt()
-            val availableHeight = initialRectF.height() - (padding * 2)
+            val centerX = box.centerX().toFloat()
+            val centerY = box.centerY().toFloat()
 
-            if (availableWidth <= 0 || availableHeight <= 0) continue
+            // Available dimensions inside the comic speech bubble
+            // For narrow vertical bubbles, ensure at least 100px width so Latin words can wrap naturally
+            val availableWidth = maxOf((box.width() * 0.88f), 100f)
+                .toInt()
+                .coerceAtMost((screenWidth - 24f).toInt())
 
-            // Auto-size font size: start from 36f, decrease down to minimum 16f
-            var textSize = 36f
+            val availableHeight = maxOf((box.height() * 0.88f), 40f)
+
+            // Dynamic font sizing: start from fitting size down to 12f
+            var textSize = minOf(30f, maxOf(16f, box.height() * 0.38f))
             var selectedLayout: StaticLayout? = null
 
-            while (textSize >= 16f) {
-                textPaint.textSize = textSize
+            while (textSize >= 12f) {
+                textFillPaint.textSize = textSize
                 val layout = StaticLayout.Builder.obtain(
                     text,
                     0,
                     text.length,
-                    textPaint,
+                    textFillPaint,
                     availableWidth
                 )
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)
@@ -107,29 +123,57 @@ class OverlayView @JvmOverloads constructor(
                 if (layout.height <= availableHeight) {
                     break
                 }
-                textSize -= 2f
+                textSize -= 1.5f
             }
 
-            selectedLayout?.let { layout ->
-                // Ensure the background box expands if layout height exceeds available height
-                val boxBottom = maxOf(initialRectF.bottom, initialRectF.top + layout.height + (padding * 2))
-                val finalRectF = RectF(initialRectF.left, initialRectF.top, initialRectF.right, boxBottom)
+            val layout = selectedLayout ?: continue
+            val layoutWidth = layout.width.toFloat()
+            val layoutHeight = layout.height.toFloat()
 
-                // Draw solid rounded white background
-                canvas.drawRoundRect(finalRectF, cornerRadius, cornerRadius, bgPaint)
-                // Draw thin black border
-                canvas.drawRoundRect(finalRectF, cornerRadius, cornerRadius, borderPaint)
+            // Calculate draw coordinates perfectly centered inside the speech bubble
+            val rawDrawX = centerX - (layoutWidth / 2f)
+            val rawDrawY = centerY - (layoutHeight / 2f)
 
-                // Center vertically inside bounding box
-                val currentHeight = finalRectF.height() - (padding * 2)
-                val verticalOffset = finalRectF.top + padding + maxOf(0f, (currentHeight - layout.height) / 2f)
-                val horizontalOffset = finalRectF.left + padding
+            // Clamp inside screen bounds
+            val drawX = rawDrawX.coerceIn(8f, screenWidth - layoutWidth - 8f)
+            val drawY = rawDrawY.coerceIn(8f, screenHeight - layoutHeight - 8f)
 
-                canvas.save()
-                canvas.translate(horizontalOffset, verticalOffset)
-                layout.draw(canvas)
-                canvas.restore()
+            // Background rendering
+            if (bgStyle == STYLE_SEAMLESS_WHITE) {
+                // Erase old foreign text inside the bubble with pure white patch (NO border lines)
+                val pad = 6f
+                val patchRect = RectF(
+                    drawX - pad,
+                    drawY - pad,
+                    drawX + layoutWidth + pad,
+                    drawY + layoutHeight + pad
+                )
+                canvas.drawRoundRect(patchRect, 10f, 10f, seamlessWhitePaint)
             }
+            // For STYLE_TRANSPARENT: zero background drawn! (as requested by user)
+
+            // Render Comic Text:
+            // 1. White stroke halo outline (masks underlying lines and provides maximum contrast)
+            textStrokePaint.textSize = textSize
+            textStrokePaint.strokeWidth = maxOf(4f, textSize * 0.22f)
+            val strokeLayout = StaticLayout.Builder.obtain(
+                text,
+                0,
+                text.length,
+                textStrokePaint,
+                layout.width
+            )
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setIncludePad(false)
+                .build()
+
+            canvas.save()
+            canvas.translate(drawX, drawY)
+            strokeLayout.draw(canvas)
+
+            // 2. Crisp bold black text fill
+            layout.draw(canvas)
+            canvas.restore()
         }
     }
 }

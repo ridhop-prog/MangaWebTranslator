@@ -134,6 +134,68 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- Text Background Style Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardBackgroundColor="#1E1E2E"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="4dp"
+            app:strokeColor="#33FFFFFF"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Gaya Background Teks:"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="Pilih apakah ingin teks bersih tanpa kotak background atau menyatu bubble."
+                    android:textColor="#AAAAFF"
+                    android:textSize="12sp" />
+
+                <RadioGroup
+                    android:id="@+id/rgBgStyle"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp">
+
+                    <RadioButton
+                        android:id="@+id/rbTransparent"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:buttonTint="#7C4DFF"
+                        android:checked="true"
+                        android:text="Tanpa Background (Teks Bersih Comic Style)"
+                        android:textColor="#E0E0FF"
+                        android:textSize="13sp" />
+
+                    <RadioButton
+                        android:id="@+id/rbSeamlessWhite"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:buttonTint="#7C4DFF"
+                        android:text="Menyatu Bubble (Putih Bersih Tanpa Garis Kotak)"
+                        android:textColor="#E0E0FF"
+                        android:textSize="13sp" />
+                </RadioGroup>
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Action Buttons -->
         <Button
             android:id="@+id/btnStartFloating"

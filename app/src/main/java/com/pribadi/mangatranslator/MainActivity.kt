@@ -32,6 +32,7 @@ class MainActivity : AppCompatActivity() {
 
     private val PREF_NAME = "ScreenMangaTranslatorPrefs"
     private val PREF_KEY_LANG = "pref_key_lang_index"
+    private val PREF_KEY_BG_STYLE = "pref_key_bg_style"
 
     // Launcher for Screen Capture MediaProjection
     private val screenCaptureLauncher = registerForActivityResult(
@@ -65,6 +66,7 @@ class MainActivity : AppCompatActivity() {
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         setupLanguageSpinner()
+        setupBgStyleSelector()
         setupButtons()
         requestNotificationPermissionIfNeeded()
 
@@ -89,6 +91,24 @@ class MainActivity : AppCompatActivity() {
 
         val savedLang = prefs.getInt(PREF_KEY_LANG, 0)
         binding.spinnerLang.setSelection(savedLang)
+    }
+
+    private fun setupBgStyleSelector() {
+        val savedStyle = prefs.getInt(PREF_KEY_BG_STYLE, OverlayView.STYLE_TRANSPARENT)
+        if (savedStyle == OverlayView.STYLE_SEAMLESS_WHITE) {
+            binding.rbSeamlessWhite.isChecked = true
+        } else {
+            binding.rbTransparent.isChecked = true
+        }
+
+        binding.rgBgStyle.setOnCheckedChangeListener { _, checkedId ->
+            val style = if (checkedId == R.id.rbSeamlessWhite) {
+                OverlayView.STYLE_SEAMLESS_WHITE
+            } else {
+                OverlayView.STYLE_TRANSPARENT
+            }
+            prefs.edit().putInt(PREF_KEY_BG_STYLE, style).apply()
+        }
     }
 
     private fun setupButtons() {
@@ -189,10 +209,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchFloatingService(resultCode: Int, resultData: Intent) {
         val selectedLang = binding.spinnerLang.selectedItemPosition
+        val bgStyle = if (binding.rbSeamlessWhite.isChecked) {
+            OverlayView.STYLE_SEAMLESS_WHITE
+        } else {
+            OverlayView.STYLE_TRANSPARENT
+        }
+
         val serviceIntent = Intent(this, FloatingService::class.java).apply {
             putExtra(FloatingService.EXTRA_RESULT_CODE, resultCode)
             putExtra(FloatingService.EXTRA_RESULT_DATA, resultData)
             putExtra(FloatingService.EXTRA_LANG_INDEX, selectedLang)
+            putExtra(FloatingService.EXTRA_BG_STYLE, bgStyle)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
