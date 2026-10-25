@@ -400,15 +400,14 @@ class FloatingService : Service() {
     private fun performAutoTranslateCheck() {
         if (isTranslating || mediaProjection == null || virtualDisplay == null) return
 
-        var currentBmp: Bitmap? = null
-        synchronized(bitmapLock) {
+        val currentBmp = synchronized(bitmapLock) {
             val bmp = latestBitmap
             if (bmp != null && !bmp.isRecycled) {
-                currentBmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                bmp.copy(Bitmap.Config.ARGB_8888, false)
+            } else {
+                null
             }
-        }
-
-        if (currentBmp == null) return
+        } ?: return
 
         // Compare with previous screen samples to avoid re-translating static screen
         if (!hasScreenChangedSignificantly(currentBmp, lastScreenSamples)) {
