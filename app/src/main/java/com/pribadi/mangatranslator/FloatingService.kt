@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -24,7 +25,9 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
+import android.util.LruCache
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -41,11 +44,13 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlin.math.abs
 import kotlin.math.hypot
 
 class FloatingService : Service() {
@@ -58,9 +63,18 @@ class FloatingService : Service() {
         const val EXTRA_LANG_INDEX = "extra_lang_index"
         const val EXTRA_BG_STYLE = "extra_bg_style"
         const val ACTION_STOP = "action_stop_floating_service"
+        private const val AUTO_POLL_INTERVAL_MS = 220L
+        private const val SCROLL_SETTLE_MS = 230L
+        private const val LONG_PRESS_CLEAR_MS = 500L
         var isRunning = false
             private set
     }
+
+    private data class MergedOcrBlock(
+        val boundingBox: Rect,
+        val bubbleBox: Rect,
+        val cleanText: String
+    )
 
     private lateinit var windowManager: WindowManager
     private val handler = Handler(Looper.getMainLooper())
@@ -68,16 +82,36 @@ class FloatingService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var currentLangIndex = 0 // 0: Japanese, 1: Korean, 2: English
     private var bgStyle = OverlayView.STYLE_TRANSPARENT
+    @Volatile
     private var isTranslating = false
 
+    // Fast LRU cache for translated dialogue lines so scrolled bubbles re-render instantly
+    private val translationCache = LruCache<String, String>(250)
+
+    // Real-time visual scroll tracker
+    private val scrollTracker = ScrollTracker {
+        handler.post {
+            if (!isRunning || isTranslating) return@post
+            lastScreenSamples = null
+            lastOcrShiftY = Float.NaN
+            hideOverlay()
+            if (isAutoMode) {
+                handler.removeCallbacks(autoTranslateRunnable)
+                handler.postDelayed(autoTranslateRunnable, 140L)
+            }
+        }
+    }
+
     // Auto-Translate / Continuous Scroll Engine
+    @Volatile
     private var isAutoMode = false
     private var lastScreenSamples: IntArray? = null
+    private var lastOcrShiftY: Float = Float.NaN
     private val autoTranslateRunnable = object : Runnable {
         override fun run() {
             if (!isAutoMode || !isRunning) return
             performAutoTranslateCheck()
-            handler.postDelayed(this, 2000)
+            handler.postDelayed(this, AUTO_POLL_INTERVAL_MS)
         }
     }
 
@@ -86,7 +120,13 @@ class FloatingService : Service() {
     private var imageReader: ImageReader? = null
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
+    private var rawBufferBitmap: Bitmap? = null
     private var latestBitmap: Bitmap? = null
+    private var latestBitmapCanvas: Canvas? = null
+    private var hasLatestBitmapFrame = false
+    private var latestBitmapShiftY = 0f
+    private val rawSrcRect = Rect()
+    private val rawDstRect = Rect()
     private val bitmapLock = Any()
     private var captureWidth = 0
     private var captureHeight = 0
@@ -101,7 +141,9 @@ class FloatingService : Service() {
     private var overlayParams: WindowManager.LayoutParams? = null
     private var statusParams: WindowManager.LayoutParams? = null
 
+    @Volatile
     private var isOverlayAttached = false
+    @Volatile
     private var isStatusAttached = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -278,11 +320,21 @@ class FloatingService : Service() {
             stopSelf()
         }
 
-        // Touch & Drag Handling for Floating Bubble
+        // Touch, Drag & Long-Press Handling for Floating Bubble
         var initialX = 0
         var initialY = 0
         var initialTouchX = 0f
         var initialTouchY = 0f
+        var longPressTriggered = false
+
+        val longPressRunnable = Runnable {
+            longPressTriggered = true
+            btnMain?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            hideOverlay()
+            lastOcrShiftY = Float.NaN
+            lastScreenSamples = null
+            Toast.makeText(this, "Tampilan terjemahan dibersihkan", Toast.LENGTH_SHORT).show()
+        }
 
         btnMain?.setOnTouchListener { _, event ->
             val params = bubbleParams ?: return@setOnTouchListener false
@@ -292,25 +344,40 @@ class FloatingService : Service() {
                     initialY = params.y
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
+                    longPressTriggered = false
+                    handler.removeCallbacks(longPressRunnable)
+                    handler.postDelayed(longPressRunnable, LONG_PRESS_CLEAR_MS)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = initialX + (event.rawX - initialTouchX).toInt()
-                    params.y = initialY + (event.rawY - initialTouchY).toInt()
+                    val diffX = event.rawX - initialTouchX
+                    val diffY = event.rawY - initialTouchY
+                    if (hypot(diffX.toDouble(), diffY.toDouble()) >= 15) {
+                        handler.removeCallbacks(longPressRunnable)
+                    }
+                    params.x = initialX + diffX.toInt()
+                    params.y = initialY + diffY.toInt()
                     windowManager.updateViewLayout(floatingBubbleView, params)
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    val diffX = event.rawX - initialTouchX
-                    val diffY = event.rawY - initialTouchY
-                    // If drag distance is very small, treat as click
-                    if (hypot(diffX.toDouble(), diffY.toDouble()) < 15) {
-                        if (!isTranslating) {
-                            startScreenTranslation(ivIcon, pbLoading)
-                        } else {
-                            Toast.makeText(this, "Sedang menerjemahkan...", Toast.LENGTH_SHORT).show()
+                    handler.removeCallbacks(longPressRunnable)
+                    if (!longPressTriggered) {
+                        val diffX = event.rawX - initialTouchX
+                        val diffY = event.rawY - initialTouchY
+                        // If drag distance is very small, treat as click
+                        if (hypot(diffX.toDouble(), diffY.toDouble()) < 15) {
+                            if (!isTranslating) {
+                                startScreenTranslation(ivIcon, pbLoading)
+                            } else {
+                                Toast.makeText(this, "Sedang menerjemahkan...", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    handler.removeCallbacks(longPressRunnable)
                     true
                 }
                 else -> false
@@ -325,26 +392,23 @@ class FloatingService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             y = 120
         }
 
-        // Setup Fullscreen OverlayView
+        // Setup Fullscreen Touch-Pass-Through OverlayView
         overlayView = OverlayView(this).apply {
             val prefs = getSharedPreferences("ScreenMangaTranslatorPrefs", Context.MODE_PRIVATE)
             bgStyle = prefs.getInt("pref_key_bg_style", OverlayView.STYLE_TRANSPARENT)
-            onDismiss = {
-                hideOverlay()
-            }
         }
         overlayParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
             PixelFormat.TRANSLUCENT
         )
     }
@@ -367,19 +431,20 @@ class FloatingService : Service() {
     }
 
     private fun toggleAutoMode() {
-        val ivIcon = floatingBubbleView?.findViewById<ImageView>(R.id.ivIcon)
-        val pbLoading = floatingBubbleView?.findViewById<ProgressBar>(R.id.pbLoading)
-
         isAutoMode = !isAutoMode
         updateAutoModeUI()
 
         if (isAutoMode) {
             lastScreenSamples = null
+            lastOcrShiftY = Float.NaN
+            hideOverlay()
+            scrollTracker.reset(0f)
+            overlayView?.resetScrollState(0f)
             handler.removeCallbacks(autoTranslateRunnable)
             handler.post(autoTranslateRunnable)
             Toast.makeText(
                 this,
-                "Mode Auto AKTIF: Komik diterjemahkan otomatis saat membaca",
+                "Mode Auto AKTIF: Terjemahan otomatis mengikuti scroll komik",
                 Toast.LENGTH_SHORT
             ).show()
         } else {
@@ -410,23 +475,32 @@ class FloatingService : Service() {
 
     private fun performAutoTranslateCheck() {
         if (isTranslating || mediaProjection == null || virtualDisplay == null) return
+        if (!scrollTracker.isScrollingSettled(SCROLL_SETTLE_MS)) return
 
-        val currentBmp = synchronized(bitmapLock) {
+        var checkBmp: Bitmap? = null
+        var currentShiftY = 0f
+        synchronized(bitmapLock) {
             val bmp = latestBitmap
-            if (bmp != null && !bmp.isRecycled) {
-                bmp.copy(Bitmap.Config.ARGB_8888, false)
-            } else {
-                null
+            if (bmp != null && !bmp.isRecycled && hasLatestBitmapFrame) {
+                checkBmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                currentShiftY = latestBitmapShiftY
             }
-        } ?: return
+        }
+        val bmp = checkBmp ?: return
 
-        // Compare with previous screen samples to avoid re-translating static screen
-        if (!hasScreenChangedSignificantly(currentBmp, lastScreenSamples)) {
+        val maskedRects = collectMaskedRectsForTracker()
+        val scrolledByTracker = !lastOcrShiftY.isNaN() &&
+            abs(currentShiftY - lastOcrShiftY) > captureHeight * 0.045f
+        val unmaskedScreenChanged = hasUnmaskedScreenChanged(bmp, lastScreenSamples, maskedRects)
+        bmp.recycle()
+
+        if (!lastOcrShiftY.isNaN() && !scrolledByTracker && !unmaskedScreenChanged) {
             return
         }
 
-        lastScreenSamples = extractScreenSamples(currentBmp)
-
+        // Screen has scrolled or changed:
+        // 1. Immediately clear old scrolled bubbles so they NEVER stack or linger
+        // 2. Capture a 100% clean frame (without OverlayView drawn on top) after 65ms
         val ivIcon = floatingBubbleView?.findViewById<ImageView>(R.id.ivIcon)
         val pbLoading = floatingBubbleView?.findViewById<ProgressBar>(R.id.pbLoading)
 
@@ -434,16 +508,39 @@ class FloatingService : Service() {
         ivIcon?.visibility = View.GONE
         pbLoading?.visibility = View.VISIBLE
 
-        processBitmapTranslation(currentBmp, ivIcon, pbLoading, isAuto = true)
+        hideOverlay()
+        scrollTracker.reset(0f)
+
+        captureScreen(delayMs = 65L) { cleanBmp, cleanShiftY ->
+            if (!isAutoMode || !isRunning || cleanBmp == null) {
+                cleanBmp?.recycle()
+                finishTranslation(ivIcon, pbLoading)
+                return@captureScreen
+            }
+
+            lastScreenSamples = extractScreenSamples(cleanBmp)
+            lastOcrShiftY = cleanShiftY
+
+            processBitmapTranslation(cleanBmp, cleanShiftY, ivIcon, pbLoading, isAuto = true)
+        }
     }
 
-    private fun hasScreenChangedSignificantly(current: Bitmap, referenceSamples: IntArray?): Boolean {
+    /**
+     * Compares current screen pixels outside [maskedRects] with [referenceSamples] from the last
+     * clean scan so scroll/page changes are always detected even if [OverlayView] is visible.
+     */
+    private fun hasUnmaskedScreenChanged(
+        current: Bitmap,
+        referenceSamples: IntArray?,
+        maskedRects: List<Rect>
+    ): Boolean {
         if (referenceSamples == null) return true
         val width = current.width
         val height = current.height
         if (width < 50 || height < 50) return true
 
         var diffCount = 0
+        var validSampleCount = 0
         var sampleIdx = 0
 
         val startX = (width * 0.15).toInt()
@@ -456,17 +553,39 @@ class FloatingService : Service() {
         for (y in startY until endY step stepY) {
             for (x in startX until endX step stepX) {
                 if (sampleIdx >= referenceSamples.size) break
-                val curPixel = current.getPixel(x, y)
                 val refPixel = referenceSamples[sampleIdx]
-                if (curPixel != refPixel) {
+                sampleIdx++
+
+                var insideMask = false
+                for (i in maskedRects.indices) {
+                    if (maskedRects[i].contains(x, y)) {
+                        insideMask = true
+                        break
+                    }
+                }
+                if (insideMask) continue
+
+                validSampleCount++
+                val curPixel = current.getPixel(x, y)
+                if (!pixelsAreSimilar(curPixel, refPixel)) {
                     diffCount++
                 }
-                sampleIdx++
             }
         }
 
-        // If more than 8% of sampled pixels changed, the screen has moved
-        return diffCount > 8
+        if (validSampleCount < 10) return true
+        return (diffCount.toFloat() / validSampleCount.toFloat()) > 0.075f
+    }
+
+    private fun pixelsAreSimilar(p1: Int, p2: Int): Boolean {
+        if (p1 == p2) return true
+        val r1 = (p1 shr 16) and 0xFF
+        val g1 = (p1 shr 8) and 0xFF
+        val b1 = p1 and 0xFF
+        val r2 = (p2 shr 16) and 0xFF
+        val g2 = (p2 shr 8) and 0xFF
+        val b2 = p2 and 0xFF
+        return abs(r1 - r2) + abs(g1 - g2) + abs(b1 - b2) <= 18
     }
 
     private fun extractScreenSamples(bitmap: Bitmap): IntArray {
@@ -493,21 +612,17 @@ class FloatingService : Service() {
     }
 
     private fun showOverlay(blocks: List<TranslatedBlock>) {
-        val flags = if (isAutoMode) {
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        } else {
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        }
-
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         overlayParams?.flags = flags
 
-        if (isOverlayAttached && overlayView != null) {
-            windowManager.updateViewLayout(overlayView, overlayParams)
-        } else if (!isOverlayAttached && overlayView != null) {
+        if (!isOverlayAttached && overlayView != null) {
             windowManager.addView(overlayView, overlayParams)
             isOverlayAttached = true
         }
+
+        // Always replace blocks cleanly (never merge/accumulate old blocks across scans)
+        overlayView?.resetScrollState(scrollTracker.currentShiftY)
         overlayView?.setTranslatedBlocks(blocks)
     }
 
@@ -517,6 +632,57 @@ class FloatingService : Service() {
             windowManager.removeView(overlayView)
             isOverlayAttached = false
         }
+    }
+
+    private fun collectMaskedRectsForTracker(): List<Rect> {
+        val overlay = overlayView
+        val overlayRects = if (isOverlayAttached && overlay != null && overlay.hasBlocks()) {
+            overlay.getMaskedScreenRects(scrollTracker.currentShiftY, extraPadding = 12)
+        } else {
+            emptyList()
+        }
+
+        val bubbleRect = getBubbleScreenRect(padding = 12)
+        val statusRect = getStatusScreenRect(padding = 10)
+        if (bubbleRect == null && statusRect == null) return overlayRects
+
+        val combined = ArrayList<Rect>(overlayRects.size + 2)
+        combined.addAll(overlayRects)
+        if (bubbleRect != null) combined.add(bubbleRect)
+        if (statusRect != null) combined.add(statusRect)
+        return combined
+    }
+
+    private fun getBubbleScreenRect(padding: Int): Rect? {
+        val view = floatingBubbleView ?: return null
+        val params = bubbleParams ?: return null
+        if (view.visibility != View.VISIBLE) return null
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return null
+        return Rect(
+            params.x - padding,
+            params.y - padding,
+            params.x + w + padding,
+            params.y + h + padding
+        )
+    }
+
+    private fun getStatusScreenRect(padding: Int): Rect? {
+        if (!isStatusAttached) return null
+        val view = floatingStatusView ?: return null
+        val params = statusParams ?: return null
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return null
+        val sx = (captureWidth - w) / 2
+        val sy = params.y
+        return Rect(
+            sx - padding,
+            sy - padding,
+            sx + w + padding,
+            sy + h + padding
+        )
     }
 
     @Suppress("DEPRECATION")
@@ -547,29 +713,74 @@ class FloatingService : Service() {
                     val buffer = planes[0].buffer
                     val pixelStride = planes[0].pixelStride
                     val rowStride = planes[0].rowStride
-                    val rowPadding = rowStride - pixelStride * captureWidth
 
-                    val bmp = Bitmap.createBitmap(
-                        captureWidth + rowPadding / pixelStride,
-                        captureHeight,
-                        Bitmap.Config.ARGB_8888
-                    )
-                    bmp.copyPixelsFromBuffer(buffer)
-
-                    val finalBmp = if (rowPadding == 0) {
-                        bmp
-                    } else {
-                        val cropped = Bitmap.createBitmap(bmp, 0, 0, captureWidth, captureHeight)
-                        bmp.recycle()
-                        cropped
+                    val hasActiveOverlay = isOverlayAttached && (overlayView?.hasBlocks() == true)
+                    if (hasActiveOverlay || isAutoMode || isTranslating) {
+                        val maskedRects = collectMaskedRectsForTracker()
+                        scrollTracker.processFrame(
+                            buffer = buffer,
+                            width = captureWidth,
+                            height = captureHeight,
+                            pixelStride = pixelStride,
+                            rowStride = rowStride,
+                            maskedRects = maskedRects
+                        )
+                        if (hasActiveOverlay) {
+                            overlayView?.updateScrollState(
+                                scrollTracker.currentShiftY,
+                                scrollTracker.velocityPxPerMs
+                            )
+                        }
                     }
 
-                    synchronized(bitmapLock) {
-                        latestBitmap?.recycle()
-                        latestBitmap = finalBmp
+                    // Skip copying full-screen bitmap on high-velocity scroll frames once we have a frame
+                    val isFastScrolling = abs(scrollTracker.velocityPxPerMs) > 0.6f
+                    if (!isFastScrolling || !hasLatestBitmapFrame) {
+                        val rowPadding = rowStride - pixelStride * captureWidth
+                        val rowWidth = captureWidth + rowPadding / pixelStride
+                        buffer.rewind()
+
+                        synchronized(bitmapLock) {
+                            var dest = latestBitmap
+                            if (dest == null || dest.isRecycled ||
+                                dest.width != captureWidth || dest.height != captureHeight
+                            ) {
+                                dest?.recycle()
+                                dest = Bitmap.createBitmap(
+                                    captureWidth,
+                                    captureHeight,
+                                    Bitmap.Config.ARGB_8888
+                                )
+                                latestBitmap = dest
+                                latestBitmapCanvas = Canvas(dest)
+                            }
+
+                            if (rowPadding == 0) {
+                                dest.copyPixelsFromBuffer(buffer)
+                            } else {
+                                var raw = rawBufferBitmap
+                                if (raw == null || raw.isRecycled ||
+                                    raw.width != rowWidth || raw.height != captureHeight
+                                ) {
+                                    raw?.recycle()
+                                    raw = Bitmap.createBitmap(
+                                        rowWidth,
+                                        captureHeight,
+                                        Bitmap.Config.ARGB_8888
+                                    )
+                                    rawBufferBitmap = raw
+                                }
+                                raw.copyPixelsFromBuffer(buffer)
+                                rawSrcRect.set(0, 0, captureWidth, captureHeight)
+                                rawDstRect.set(0, 0, captureWidth, captureHeight)
+                                latestBitmapCanvas?.drawBitmap(raw, rawSrcRect, rawDstRect, null)
+                            }
+                            latestBitmapShiftY = scrollTracker.currentShiftY
+                            hasLatestBitmapFrame = true
+                        }
                     }
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 // ignore image read exceptions
             } finally {
                 image?.close()
@@ -597,9 +808,14 @@ class FloatingService : Service() {
             captureThread?.quitSafely()
             captureThread = null
             synchronized(bitmapLock) {
+                hasLatestBitmapFrame = false
+                latestBitmapCanvas = null
                 latestBitmap?.recycle()
                 latestBitmap = null
+                rawBufferBitmap?.recycle()
+                rawBufferBitmap = null
             }
+            scrollTracker.reset(0f)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -611,12 +827,13 @@ class FloatingService : Service() {
         pbLoading?.visibility = View.VISIBLE
 
         hideOverlay()
+        scrollTracker.reset(0f)
         showStatus(getString(R.string.status_capturing))
 
         // Temporarily hide bubble so SurfaceFlinger sends a fresh frame without the bubble
         floatingBubbleView?.visibility = View.INVISIBLE
 
-        captureScreen { bitmap ->
+        captureScreen(delayMs = 90L) { bitmap, scanShiftY ->
             floatingBubbleView?.visibility = View.VISIBLE
 
             if (bitmap == null) {
@@ -625,12 +842,16 @@ class FloatingService : Service() {
                 return@captureScreen
             }
 
-            processBitmapTranslation(bitmap, ivIcon, pbLoading, isAuto = false)
+            lastScreenSamples = extractScreenSamples(bitmap)
+            lastOcrShiftY = scanShiftY
+
+            processBitmapTranslation(bitmap, scanShiftY, ivIcon, pbLoading, isAuto = false)
         }
     }
 
     private fun processBitmapTranslation(
         bitmap: Bitmap,
+        scanShiftY: Float,
         ivIcon: ImageView?,
         pbLoading: ProgressBar?,
         isAuto: Boolean = false
@@ -657,28 +878,20 @@ class FloatingService : Service() {
         val inputImage = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
-                val bubbleRect = Rect()
-                val bParams = bubbleParams
-                if (floatingBubbleView != null && bParams != null) {
-                    val bX = bParams.x
-                    val bY = bParams.y
-                    val bW = floatingBubbleView?.width ?: 0
-                    val bH = floatingBubbleView?.height ?: 0
-                    bubbleRect.set(bX - 20, bY - 20, bX + bW + 20, bY + bH + 20)
-                }
+                val bubbleRect = getBubbleScreenRect(padding = 20) ?: Rect()
 
                 val validBlocks = visionText.textBlocks.filter { block ->
                     val box = block.boundingBox ?: return@filter false
                     if (box.width() < 14 || box.height() < 14) return@filter false
 
-                    // 1. Exclude Android system status bar (top ~5%)
-                    if (box.top < captureHeight * 0.052f) return@filter false
+                    // 1. Exclude Android system status bar (top ~5.5%)
+                    if (box.top < captureHeight * 0.055f) return@filter false
 
-                    // 2. Exclude Android system navigation & browser address bar (bottom ~7%)
+                    // 2. Exclude Android system navigation & browser address bar (bottom ~6.5%)
                     if (box.bottom > captureHeight * 0.935f) return@filter false
 
                     // 3. Exclude Floating bubble UI itself
-                    if (Rect.intersects(box, bubbleRect)) return@filter false
+                    if (!bubbleRect.isEmpty && Rect.intersects(box, bubbleRect)) return@filter false
 
                     val cleanText = block.text.replace("\n", " ").trim()
                     val letterCount = cleanText.count { it.isLetter() }
@@ -700,26 +913,30 @@ class FloatingService : Service() {
                 }
 
                 if (validBlocks.isEmpty()) {
+                    bitmap.recycle()
                     finishTranslation(ivIcon, pbLoading)
                     recognizer.close()
-                    if (isAuto) {
-                        hideOverlay()
-                    } else {
+                    hideOverlay()
+                    if (!isAuto) {
                         Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
                     }
                     return@addOnSuccessListener
                 }
 
                 // Detect comic speech bubble bounds for each valid text block
-                val bubbleBoxes = validBlocks.map { block ->
+                val rawBubbleBoxes = validBlocks.map { block ->
                     block.boundingBox?.let { box ->
                         SpeechBubbleDetector.detectBubbleBounds(bitmap, box)
                     }
                 }
+                bitmap.recycle()
+
+                // Merge OCR blocks that belong to the same speech bubble so they never stack on top of each other
+                val mergedBlocks = mergeSameBubbleBlocks(validBlocks, rawBubbleBoxes)
 
                 // Smart Language Auto-Detection:
                 // Scan detected text characters to detect English vs Japanese vs Korean
-                val allText = validBlocks.joinToString(" ") { it.text }
+                val allText = mergedBlocks.joinToString(" ") { it.cleanText }
                 val hasJapanese = allText.any { c ->
                     (c in '\u3040'..'\u309F') || // Hiragana
                     (c in '\u30A0'..'\u30FF') || // Katakana
@@ -773,22 +990,38 @@ class FloatingService : Service() {
                             showStatus(getString(R.string.status_translating))
                         }
 
-                        val tasks = validBlocks.map { block ->
-                            val cleanText = block.text.replace("\n", " ").trim()
-                            translator.translate(cleanText)
+                        val tasks = mergedBlocks.map { item ->
+                            val cacheKey = "$sourceLangCode:${item.cleanText.lowercase()}"
+                            val cached = translationCache.get(cacheKey)
+                            if (cached != null) {
+                                Tasks.forResult(cached)
+                            } else {
+                                translator.translate(item.cleanText).addOnSuccessListener { translated ->
+                                    if (!translated.isNullOrBlank()) {
+                                        translationCache.put(cacheKey, translated)
+                                    }
+                                }
+                            }
                         }
 
                         Tasks.whenAllComplete(tasks)
                             .addOnCompleteListener {
                                 val results = mutableListOf<TranslatedBlock>()
-                                for (i in validBlocks.indices) {
+                                for (i in mergedBlocks.indices) {
                                     val task = tasks[i]
                                     if (task.isSuccessful) {
-                                        val translated = task.result as? String
-                                        val box = validBlocks[i].boundingBox
-                                        val bubble = bubbleBoxes.getOrNull(i)
-                                        if (!translated.isNullOrBlank() && box != null) {
-                                            results.add(TranslatedBlock(box, translated, bubble))
+                                        val translated = task.result
+                                        val item = mergedBlocks[i]
+                                        if (!translated.isNullOrBlank()) {
+                                            results.add(
+                                                TranslatedBlock(
+                                                    boundingBox = item.boundingBox,
+                                                    translatedText = translated,
+                                                    bubbleBox = item.bubbleBox,
+                                                    captureShiftY = scanShiftY,
+                                                    originalText = item.cleanText
+                                                )
+                                            )
                                         }
                                     }
                                 }
@@ -802,14 +1035,13 @@ class FloatingService : Service() {
                                     if (!isAuto) {
                                         Toast.makeText(
                                             this,
-                                            "Terjemahan siap (${results.size} balon teks). Ketuk layar untuk menutup.",
+                                            "Terjemahan siap (${results.size} balon teks). Tahan tombol melayang untuk menutup.",
                                             Toast.LENGTH_SHORT
                                         ).show()
                                     }
                                 } else {
-                                    if (isAuto) {
-                                        hideOverlay()
-                                    } else {
+                                    hideOverlay()
+                                    if (!isAuto) {
                                         Toast.makeText(this, getString(R.string.status_no_text), Toast.LENGTH_SHORT).show()
                                     }
                                 }
@@ -825,12 +1057,155 @@ class FloatingService : Service() {
                     }
             }
             .addOnFailureListener { e ->
+                bitmap.recycle()
                 finishTranslation(ivIcon, pbLoading)
                 recognizer.close()
                 if (!isAuto) {
                     Toast.makeText(this, "Gagal memindai: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
                 }
             }
+    }
+
+    /**
+     * Groups and merges OCR [Text.TextBlock]s that reside inside the same comic speech bubble
+     * so multi-part dialogue in a single bubble is translated as one sentence and never stacks.
+     */
+    private fun mergeSameBubbleBlocks(
+        blocks: List<Text.TextBlock>,
+        bubbleBoxes: List<Rect?>
+    ): List<MergedOcrBlock> {
+        val items = ArrayList<MergedOcrBlock>(blocks.size)
+        for (i in blocks.indices) {
+            val box = blocks[i].boundingBox ?: continue
+            val bubble = bubbleBoxes.getOrNull(i) ?: Rect(box)
+            val clean = blocks[i].text.replace("\n", " ").trim()
+            if (clean.isNotEmpty()) {
+                items.add(MergedOcrBlock(Rect(box), Rect(bubble), clean))
+            }
+        }
+        if (items.size <= 1) return items
+
+        val n = items.size
+        val parent = IntArray(n) { it }
+        fun find(x: Int): Int {
+            var r = x
+            while (parent[r] != r) r = parent[r]
+            var curr = x
+            while (curr != r) {
+                val nxt = parent[curr]
+                parent[curr] = r
+                curr = nxt
+            }
+            return r
+        }
+        fun union(a: Int, b: Int) {
+            val ra = find(a)
+            val rb = find(b)
+            if (ra != rb) parent[rb] = ra
+        }
+
+        for (i in 0 until n) {
+            for (j in i + 1 until n) {
+                if (shouldMergeOcrBlocks(items[i], items[j])) {
+                    union(i, j)
+                }
+            }
+        }
+
+        val groups = LinkedHashMap<Int, MutableList<MergedOcrBlock>>()
+        for (i in 0 until n) {
+            val root = find(i)
+            groups.getOrPut(root) { ArrayList() }.add(items[i])
+        }
+
+        val mergedList = ArrayList<MergedOcrBlock>(groups.size)
+        for (group in groups.values) {
+            if (group.size == 1) {
+                mergedList.add(group[0])
+                continue
+            }
+
+            // Determine reading order: vertical Japanese columns (right-to-left) vs horizontal lines (top-to-bottom)
+            val isVerticalLayout = group.count { it.boundingBox.height() > it.boundingBox.width() * 1.35 } > group.size / 2
+            val sorted = if (isVerticalLayout) {
+                group.sortedWith(
+                    compareByDescending<MergedOcrBlock> { it.boundingBox.centerX() }
+                        .thenBy { it.boundingBox.centerY() }
+                )
+            } else {
+                group.sortedWith(
+                    compareBy<MergedOcrBlock> { it.boundingBox.centerY() }
+                        .thenBy { it.boundingBox.centerX() }
+                )
+            }
+
+            val unionTextBox = Rect(sorted[0].boundingBox)
+            val unionBubbleBox = Rect(sorted[0].bubbleBox)
+            val sb = StringBuilder(sorted[0].cleanText)
+
+            for (k in 1 until sorted.size) {
+                unionTextBox.union(sorted[k].boundingBox)
+                unionBubbleBox.union(sorted[k].bubbleBox)
+                sb.append(' ').append(sorted[k].cleanText)
+            }
+
+            mergedList.add(
+                MergedOcrBlock(
+                    boundingBox = unionTextBox,
+                    bubbleBox = unionBubbleBox,
+                    cleanText = sb.toString()
+                )
+            )
+        }
+
+        return mergedList
+    }
+
+    private fun shouldMergeOcrBlocks(a: MergedOcrBlock, b: MergedOcrBlock): Boolean {
+        val boxA = a.boundingBox
+        val boxB = b.boundingBox
+        if (Rect.intersects(boxA, boxB)) return true
+
+        val bubbleOverlap = rectContainmentRatio(a.bubbleBox, b.bubbleBox)
+        val horizOverlap = minOf(boxA.right, boxB.right) - maxOf(boxA.left, boxB.left)
+        val minWidth = minOf(boxA.width(), boxB.width()).coerceAtLeast(1)
+        val vertGap = maxOf(boxA.top, boxB.top) - minOf(boxA.bottom, boxB.bottom)
+        val maxHeight = maxOf(boxA.height(), boxB.height()).coerceAtLeast(1)
+
+        // Stacked horizontal lines in the same speech bubble
+        if (horizOverlap > minWidth * 0.35f && vertGap < maxHeight * 0.65f && bubbleOverlap > 0.35f) {
+            return true
+        }
+
+        // Adjacent vertical columns in the same speech bubble
+        val vertOverlap = minOf(boxA.bottom, boxB.bottom) - maxOf(boxA.top, boxB.top)
+        val minHeight = minOf(boxA.height(), boxB.height()).coerceAtLeast(1)
+        val horizGap = maxOf(boxA.left, boxB.left) - minOf(boxA.right, boxB.right)
+        val maxWidth = maxOf(boxA.width(), boxB.width()).coerceAtLeast(1)
+        if (vertOverlap > minHeight * 0.35f && horizGap < maxWidth * 0.85f && bubbleOverlap > 0.35f) {
+            return true
+        }
+
+        // Same detected enclosing speech bubble with nearby text centers
+        if (bubbleOverlap > 0.65f && vertGap < 70 && horizGap < 70) {
+            return true
+        }
+
+        return false
+    }
+
+    private fun rectContainmentRatio(a: Rect, b: Rect): Float {
+        val interLeft = maxOf(a.left, b.left)
+        val interTop = maxOf(a.top, b.top)
+        val interRight = minOf(a.right, b.right)
+        val interBottom = minOf(a.bottom, b.bottom)
+        if (interRight <= interLeft || interBottom <= interTop) return 0f
+
+        val interArea = (interRight - interLeft).toFloat() * (interBottom - interTop).toFloat()
+        val areaA = a.width().toFloat() * a.height().toFloat()
+        val areaB = b.width().toFloat() * b.height().toFloat()
+        val minArea = minOf(areaA, areaB).coerceAtLeast(1f)
+        return interArea / minArea
     }
 
     private fun finishTranslation(ivIcon: ImageView?, pbLoading: ProgressBar?) {
@@ -841,10 +1216,10 @@ class FloatingService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    private fun captureScreen(callback: (Bitmap?) -> Unit) {
+    private fun captureScreen(delayMs: Long = 90L, callback: (Bitmap?, Float) -> Unit) {
         val mp = mediaProjection
         if (mp == null) {
-            callback(null)
+            callback(null, 0f)
             return
         }
 
@@ -863,40 +1238,42 @@ class FloatingService : Service() {
         var attempts = 0
         fun checkFrame() {
             var resultBitmap: Bitmap? = null
+            var frameShiftY = 0f
             synchronized(bitmapLock) {
                 val bmp = latestBitmap
-                if (bmp != null && !bmp.isRecycled) {
+                if (bmp != null && !bmp.isRecycled && hasLatestBitmapFrame) {
                     resultBitmap = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                    frameShiftY = latestBitmapShiftY
                 }
             }
 
             if (resultBitmap != null) {
-                callback(resultBitmap)
+                callback(resultBitmap, frameShiftY)
             } else if (attempts < 6) {
                 attempts++
-                handler.postDelayed({ checkFrame() }, 60)
+                handler.postDelayed({ checkFrame() }, 50)
             } else {
-                callback(null)
+                callback(null, 0f)
             }
         }
 
-        // Wait 90ms for SurfaceFlinger to send the fresh frame without the floating bubble
-        handler.postDelayed({ checkFrame() }, 90)
+        // Wait for SurfaceFlinger to send the fresh frame without overlay/floating bubble
+        handler.postDelayed({ checkFrame() }, delayMs)
     }
 
     private fun isWebUrlOrDomain(text: String): Boolean {
         val lower = text.lowercase()
         return lower.contains("http://") ||
-                lower.contains("https://") ||
-                lower.contains(".com") ||
-                lower.contains(".net") ||
-                lower.contains(".org") ||
-                lower.contains(".co.") ||
-                lower.contains("www.") ||
-                lower.contains(".html") ||
-                lower.contains(".php") ||
-                lower.contains("webtoons") ||
-                lower.contains("scan")
+            lower.contains("https://") ||
+            lower.contains(".com") ||
+            lower.contains(".net") ||
+            lower.contains(".org") ||
+            lower.contains(".co.") ||
+            lower.contains("www.") ||
+            lower.contains(".html") ||
+            lower.contains(".php") ||
+            lower.contains("webtoons") ||
+            lower.contains("scan")
     }
 
     private val dateTimestampRegex = Regex(
@@ -921,7 +1298,7 @@ class FloatingService : Service() {
     override fun onDestroy() {
         isRunning = false
         isAutoMode = false
-        handler.removeCallbacks(autoTranslateRunnable)
+        handler.removeCallbacksAndMessages(null)
         hideOverlay()
         hideStatus()
 
