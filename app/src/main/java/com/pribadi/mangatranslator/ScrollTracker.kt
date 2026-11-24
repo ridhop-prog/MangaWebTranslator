@@ -1,5 +1,6 @@
 package com.pribadi.mangatranslator
 
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.os.SystemClock
 import java.nio.ByteBuffer
@@ -8,8 +9,10 @@ import kotlin.math.roundToInt
 
 /**
  * Real-time visual scroll tracker operating directly on ImageReader RGBA_8888 buffers.
- * Computes sub-pixel vertical scroll displacement with zero per-frame heap allocations,
- * masked against overlay regions to avoid feedback loops.
+ * - Uses smoothed coarse matching (stride 2) + sharp fine matching + parabolic sub-pixel refinement
+ *   so thin comic lines never cause missed valleys or stuttering.
+ * - Tracks an unmasked 64-point screen change ratio on the background thread (zero main-thread
+ *   bitmap copies or lock contention).
  */
 class ScrollTracker(
     private val onSceneChanged: (() -> Unit)? = null
@@ -19,14 +22,17 @@ class ScrollTracker(
         private const val NUM_BANDS = 16
         private const val MAX_FEATURES = 256
         private const val SEARCH_RADIUS_ROWS = 180
-        private const val COARSE_STRIDE = 3
+        private const val COARSE_STRIDE = 2
         private const val EDGE_THRESHOLD_PRIMARY = 10
         private const val EDGE_THRESHOLD_FALLBACK = 2
         private const val MIN_PRIMARY_FEATURES = 40
         private const val STATIONARY_ERROR_THRESHOLD = 1.8f
-        private const val SCENE_CHANGE_ERROR_THRESHOLD = 36f
-        private const val SCENE_CHANGE_CONSECUTIVE_FRAMES = 2
+        private const val SCENE_CHANGE_ERROR_THRESHOLD = 38f
+        private const val SCENE_CHANGE_CONSECUTIVE_FRAMES = 3
         private const val TRUNCATED_LOSS_CAP = 80
+
+        private const val REF_GRID_DIM = 8
+        private const val REF_GRID_SIZE = REF_GRID_DIM * REF_GRID_DIM
     }
 
     private class FrameSignature(
@@ -35,6 +41,7 @@ class ScrollTracker(
     ) {
         val totalPoints = numRows * numCols
         val luma = ByteArray(totalPoints)
+        val smoothLuma = ByteArray(totalPoints)
         val hGrad = ByteArray(totalPoints)
         val vGrad = ByteArray(totalPoints)
         val valid = BooleanArray(totalPoints)
@@ -63,6 +70,16 @@ class ScrollTracker(
     @Volatile
     private var lastScrollMoveTimeMs: Long = 0L
 
+    @Volatile
+    private var referenceShiftY: Float = Float.NaN
+
+    @Volatile
+    private var unmaskedDiffRatio: Float = 1f
+
+    @Volatile
+    private var hasReferenceSnapshot: Boolean = false
+
+    private val refGridLuma = IntArray(REF_GRID_SIZE)
     private var frameWidth = 0
     private var frameHeight = 0
     private var startY = 0
@@ -71,7 +88,7 @@ class ScrollTracker(
     private var numRows = 0
     private val colX = IntArray(NUM_COLS)
 
-    // Three pooled frames: no allocations after initial setup for a given resolution
+    // Three pooled frames: zero heap allocations after initial setup for a resolution
     private var prevFrame: FrameSignature? = null
     private var curFrame: FrameSignature? = null
     private var anchorFrame: FrameSignature? = null
@@ -81,7 +98,7 @@ class ScrollTracker(
     private var badMatchCount = 0
     private var pendingAnchorReset = false
 
-    // Scratch buffers reused per frame for salient feature extraction & coarse search
+    // Scratch buffers reused per frame
     private val bestBandColRow = IntArray(NUM_BANDS * NUM_COLS)
     private val bestBandColEnergy = IntArray(NUM_BANDS * NUM_COLS)
     private val colRects = Array(NUM_COLS) { ArrayList<Rect>(8) }
@@ -92,6 +109,60 @@ class ScrollTracker(
         val lastMove = lastScrollMoveTimeMs
         if (lastMove == 0L) return true
         return (SystemClock.uptimeMillis() - lastMove) >= settleDurationMs
+    }
+
+    /**
+     * Records a clean 64-point luminance snapshot from [bitmap] at [shiftY] so Auto Mode
+     * can detect scroll or page changes without ever copying full bitmaps on the UI thread.
+     */
+    fun recordCleanReference(bitmap: Bitmap, shiftY: Float) {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w < 64 || h < 64) return
+
+        synchronized(lock) {
+            val xStart = (w * 0.12f).toInt()
+            val xEnd = (w * 0.88f).toInt()
+            val yStart = (h * 0.12f).toInt()
+            val yEnd = (h * 0.88f).toInt()
+            val dx = maxOf(1, (xEnd - xStart) / (REF_GRID_DIM - 1))
+            val dy = maxOf(1, (yEnd - yStart) / (REF_GRID_DIM - 1))
+
+            var idx = 0
+            for (gy in 0 until REF_GRID_DIM) {
+                val py = (yStart + gy * dy).coerceIn(0, h - 1)
+                for (gx in 0 until REF_GRID_DIM) {
+                    val px = (xStart + gx * dx).coerceIn(0, w - 1)
+                    val pixel = bitmap.getPixel(px, py)
+                    val r = (pixel shr 16) and 0xFF
+                    val g = (pixel shr 8) and 0xFF
+                    val b = pixel and 0xFF
+                    refGridLuma[idx++] = (77 * r + 150 * g + 29 * b) shr 8
+                }
+            }
+            referenceShiftY = shiftY
+            unmaskedDiffRatio = 0f
+            hasReferenceSnapshot = true
+        }
+    }
+
+    fun clearReference() {
+        synchronized(lock) {
+            referenceShiftY = Float.NaN
+            unmaskedDiffRatio = 1f
+            hasReferenceSnapshot = false
+        }
+    }
+
+    /**
+     * Lock-free check called by Auto Mode on the UI thread.
+     * Returns true if the comic has scrolled by at least [minShiftPx] or if unmasked screen pixels
+     * changed noticeably since the last clean scan.
+     */
+    fun hasChangedSinceReference(minShiftPx: Float): Boolean {
+        if (!hasReferenceSnapshot || referenceShiftY.isNaN()) return true
+        if (abs(currentShiftY - referenceShiftY) >= minShiftPx) return true
+        return unmaskedDiffRatio > 0.085f
     }
 
     /**
@@ -113,20 +184,8 @@ class ScrollTracker(
     }
 
     /**
-     * Marks the next captured frame as the new reference anchor without losing currentShiftY.
-     */
-    fun requestAnchorReset() {
-        synchronized(lock) {
-            pendingAnchorReset = true
-            velocityPxPerMs = 0f
-            lastStepDyRows = 0f
-            badMatchCount = 0
-        }
-    }
-
-    /**
-     * Processes an RGBA_8888 ImageReader buffer and updates [currentShiftY] and [velocityPxPerMs].
-     * Returns true if scroll offset changed noticeably.
+     * Processes an RGBA_8888 ImageReader buffer and updates [currentShiftY], [velocityPxPerMs],
+     * and [unmaskedDiffRatio]. Returns true if scroll offset changed noticeably.
      */
     fun processFrame(
         buffer: ByteBuffer,
@@ -143,6 +202,11 @@ class ScrollTracker(
 
         synchronized(lock) {
             ensureGrid(width, height)
+
+            // Update lock-free unmasked diff ratio directly from ByteBuffer (~0.005 ms)
+            if (hasReferenceSnapshot) {
+                updateUnmaskedDiffRatio(buffer, width, height, pixelStride, rowStride, maskedRects)
+            }
 
             val prev = prevFrame ?: return false
             val cur = curFrame ?: return false
@@ -170,11 +234,11 @@ class ScrollTracker(
                 return false
             }
 
-            // Stage 1: Stationary Check at dy = 0, -1, +1
-            val err0 = evaluateShift(prev, cur, 0)
+            // Stage 1: Fast Stationary Check at dy = 0, -1, +1
+            val err0 = evaluateShiftFine(prev, cur, 0)
             if (err0 >= 0f && err0 < STATIONARY_ERROR_THRESHOLD) {
-                val errMinus = evaluateShift(prev, cur, -1)
-                val errPlus = evaluateShift(prev, cur, 1)
+                val errMinus = evaluateShiftFine(prev, cur, -1)
+                val errPlus = evaluateShiftFine(prev, cur, 1)
                 val leMinus = errMinus < 0f || err0 <= errMinus
                 val lePlus = errPlus < 0f || err0 <= errPlus
                 if (leMinus && lePlus) {
@@ -186,7 +250,7 @@ class ScrollTracker(
                 }
             }
 
-            // Stage 2: Coarse-to-Fine Frame-to-Frame Search
+            // Stage 2: Smoothed Coarse Search (stride 2 so thin lines never drop out)
             val dtMs = (nowMs - prev.timestampMs).coerceIn(1L, 200L).toFloat()
             val predictedRows = if (abs(lastStepDyRows) > 0.5f && dtMs < 80f) {
                 lastStepDyRows.roundToInt().coerceIn(-(numRows / 2), numRows / 2)
@@ -206,7 +270,7 @@ class ScrollTracker(
             topCoarseRows[2] = 0
 
             for (dy in minDy..maxDy step COARSE_STRIDE) {
-                val err = evaluateShift(prev, cur, dy)
+                val err = evaluateShiftCoarse(prev, cur, dy)
                 if (err >= 0f) {
                     insertCoarseCandidate(dy, err)
                 }
@@ -229,7 +293,7 @@ class ScrollTracker(
                 return false
             }
 
-            // Fine refinement at stride 1 around top 3 coarse candidates and 0
+            // Fine refinement at stride 1 around top 3 coarse candidates + 0
             var bestRow = 0
             var bestErr = Float.MAX_VALUE
 
@@ -245,7 +309,7 @@ class ScrollTracker(
                 val fMin = (center - COARSE_STRIDE).coerceAtLeast(-maxSearchRow)
                 val fMax = (center + COARSE_STRIDE).coerceAtMost(maxSearchRow)
                 for (dy in fMin..fMax) {
-                    val err = evaluateShift(prev, cur, dy)
+                    val err = evaluateShiftFine(prev, cur, dy)
                     if (err >= 0f && err < bestErr) {
                         bestErr = err
                         bestRow = dy
@@ -253,7 +317,7 @@ class ScrollTracker(
                 }
             }
 
-            // Scene change / large jump check
+            // Scene change check
             if (bestErr == Float.MAX_VALUE || bestErr > SCENE_CHANGE_ERROR_THRESHOLD) {
                 badMatchCount++
                 if (badMatchCount >= SCENE_CHANGE_CONSECUTIVE_FRAMES) {
@@ -273,7 +337,7 @@ class ScrollTracker(
 
             badMatchCount = 0
 
-            // Parabolic sub-row interpolation for frame-to-frame step
+            // Parabolic sub-row interpolation
             val subOffset = computeParabolicOffset(prev, cur, bestRow, bestErr, maxSearchRow)
             val exactStepRows = bestRow + subOffset
             val stepDyPixels = exactStepRows * sampleStepY
@@ -291,7 +355,7 @@ class ScrollTracker(
                 var anchorBestRow = expectedAnchorRows
                 var anchorBestErr = Float.MAX_VALUE
                 for (dy in aMin..aMax) {
-                    val err = evaluateShift(anchor, cur, dy)
+                    val err = evaluateShiftFine(anchor, cur, dy)
                     if (err >= 0f && err < anchorBestErr) {
                         anchorBestErr = err
                         anchorBestRow = dy
@@ -323,7 +387,6 @@ class ScrollTracker(
                 }
             }
 
-            // Re-anchor when cumulative distance from anchor exceeds 22% of screen height
             if (!anchor.isPopulated || abs(currentShiftY - anchorShiftY) > frameHeight * 0.22f) {
                 copySignature(cur, anchor)
                 anchorShiftY = currentShiftY
@@ -336,6 +399,64 @@ class ScrollTracker(
             onSceneChanged?.invoke()
         }
         return shiftUpdated
+    }
+
+    private fun updateUnmaskedDiffRatio(
+        buffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        pixelStride: Int,
+        rowStride: Int,
+        maskedRects: List<Rect>
+    ) {
+        val cap = buffer.capacity()
+        val xStart = (width * 0.12f).toInt()
+        val xEnd = (width * 0.88f).toInt()
+        val yStart = (height * 0.12f).toInt()
+        val yEnd = (height * 0.88f).toInt()
+        val dx = maxOf(1, (xEnd - xStart) / (REF_GRID_DIM - 1))
+        val dy = maxOf(1, (yEnd - yStart) / (REF_GRID_DIM - 1))
+
+        var idx = 0
+        var validCount = 0
+        var diffCount = 0
+
+        for (gy in 0 until REF_GRID_DIM) {
+            val py = (yStart + gy * dy).coerceIn(0, height - 1)
+            val rowBase = py * rowStride
+            for (gx in 0 until REF_GRID_DIM) {
+                val px = (xStart + gx * dx).coerceIn(0, width - 1)
+                val refLum = refGridLuma[idx++]
+
+                var insideMask = false
+                for (m in maskedRects.indices) {
+                    if (maskedRects[m].contains(px, py)) {
+                        insideMask = true
+                        break
+                    }
+                }
+                if (insideMask) continue
+
+                val off = rowBase + px * pixelStride
+                if (off + 2 >= cap) continue
+
+                val r = buffer.get(off).toInt() and 0xFF
+                val g = buffer.get(off + 1).toInt() and 0xFF
+                val b = buffer.get(off + 2).toInt() and 0xFF
+                val curLum = (77 * r + 150 * g + 29 * b) shr 8
+
+                validCount++
+                if (abs(curLum - refLum) > 14) {
+                    diffCount++
+                }
+            }
+        }
+
+        unmaskedDiffRatio = if (validCount >= 8) {
+            diffCount.toFloat() / validCount.toFloat()
+        } else {
+            0f
+        }
     }
 
     private fun ensureGrid(width: Int, height: Int) {
@@ -377,6 +498,7 @@ class ScrollTracker(
         out.clearFeatures()
 
         val luma = out.luma
+        val smoothLuma = out.smoothLuma
         val hGrad = out.hGrad
         val vGrad = out.vGrad
         val valid = out.valid
@@ -419,6 +541,7 @@ class ScrollTracker(
                 if (isMasked) {
                     valid[idx] = false
                     luma[idx] = 0
+                    smoothLuma[idx] = 0
                     hGrad[idx] = 0
                     vGrad[idx] = 0
                     idx++
@@ -446,6 +569,7 @@ class ScrollTracker(
                 val lumRight = (77 * r1 + 150 * g1 + 29 * b1) shr 8
 
                 luma[idx] = lum.toByte()
+                smoothLuma[idx] = lum.toByte()
                 hGrad[idx] = (lumRight - lum).coerceIn(-127, 127).toByte()
                 valid[idx] = true
                 idx++
@@ -468,7 +592,10 @@ class ScrollTracker(
                     continue
                 }
                 val lPrev = luma[prevRowOff + c].toInt() and 0xFF
+                val lCurr = luma[pIdx].toInt() and 0xFF
                 val lNext = luma[nextRowOff + c].toInt() and 0xFF
+                smoothLuma[pIdx] = ((lPrev + (lCurr shl 1) + lNext) shr 2).toByte()
+
                 val vg = (lNext - lPrev).coerceIn(-127, 127)
                 vGrad[pIdx] = vg.toByte()
 
@@ -519,7 +646,43 @@ class ScrollTracker(
         out.isPopulated = true
     }
 
-    private fun evaluateShift(ref: FrameSignature, cur: FrameSignature, dyRows: Int): Float {
+    private fun evaluateShiftCoarse(ref: FrameSignature, cur: FrameSignature, dyRows: Int): Float {
+        val count = ref.featureCount
+        if (count <= 0) return -1f
+
+        val minRequired = maxOf(6, count / 6)
+        var matched = 0
+        var totalLoss = 0
+
+        val refSmooth = ref.smoothLuma
+        val refVGrad = ref.vGrad
+        val curSmooth = cur.smoothLuma
+        val curVGrad = cur.vGrad
+        val curValid = cur.valid
+
+        for (i in 0 until count) {
+            val r = ref.featureRows[i]
+            val targetR = r + dyRows
+            if (targetR <= 0 || targetR >= numRows - 1) continue
+
+            val c = ref.featureCols[i]
+            val curIdx = targetR * NUM_COLS + c
+            if (!curValid[curIdx]) continue
+
+            val refIdx = r * NUM_COLS + c
+            val dLuma = abs((refSmooth[refIdx].toInt() and 0xFF) - (curSmooth[curIdx].toInt() and 0xFF))
+            val dVGrad = abs(refVGrad[refIdx].toInt() - curVGrad[curIdx].toInt())
+
+            val loss = minOf(TRUNCATED_LOSS_CAP, dLuma + dVGrad)
+            totalLoss += loss
+            matched++
+        }
+
+        if (matched < minRequired) return -1f
+        return totalLoss.toFloat() / matched.toFloat()
+    }
+
+    private fun evaluateShiftFine(ref: FrameSignature, cur: FrameSignature, dyRows: Int): Float {
         val count = ref.featureCount
         if (count <= 0) return -1f
 
@@ -566,8 +729,8 @@ class ScrollTracker(
         maxSearchRow: Int
     ): Float {
         if (bestRow - 1 < -maxSearchRow || bestRow + 1 > maxSearchRow) return 0f
-        val errMinus = evaluateShift(ref, cur, bestRow - 1)
-        val errPlus = evaluateShift(ref, cur, bestRow + 1)
+        val errMinus = evaluateShiftFine(ref, cur, bestRow - 1)
+        val errPlus = evaluateShiftFine(ref, cur, bestRow + 1)
         if (errMinus < 0f || errPlus < 0f) return 0f
 
         val denom = 2f * (errMinus - 2f * bestErr + errPlus)
@@ -596,6 +759,7 @@ class ScrollTracker(
 
     private fun copySignature(src: FrameSignature, dst: FrameSignature) {
         System.arraycopy(src.luma, 0, dst.luma, 0, src.totalPoints)
+        System.arraycopy(src.smoothLuma, 0, dst.smoothLuma, 0, src.totalPoints)
         System.arraycopy(src.hGrad, 0, dst.hGrad, 0, src.totalPoints)
         System.arraycopy(src.vGrad, 0, dst.vGrad, 0, src.totalPoints)
         System.arraycopy(src.valid, 0, dst.valid, 0, src.totalPoints)

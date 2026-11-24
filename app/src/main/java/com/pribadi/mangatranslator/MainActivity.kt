@@ -13,7 +13,6 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.View
-import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -33,8 +32,12 @@ class MainActivity : AppCompatActivity() {
     private val PREF_NAME = "ScreenMangaTranslatorPrefs"
     private val PREF_KEY_LANG = "pref_key_lang_index"
     private val PREF_KEY_BG_STYLE = "pref_key_bg_style"
+    private val PREF_KEY_TEXT_SCALE = "pref_key_text_scale"
 
-    // Launcher for Screen Capture MediaProjection
+    private var selectedLangIndex = 0 // 0: JA, 1: KO, 2: EN, 3: ZH
+    private var selectedBgStyle = OverlayView.STYLE_SEAMLESS_WHITE
+    private var selectedTextScale = 1.0f
+
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -49,7 +52,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Launcher for Notification Permission (Android 13+)
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) {
@@ -65,50 +67,138 @@ class MainActivity : AppCompatActivity() {
         projectionManager =
             getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        setupLanguageSpinner()
-        setupBgStyleSelector()
+        loadSavedSettings()
+        setupLanguageChips()
+        setupBgStyleCards()
+        setupTextScalePills()
         setupButtons()
         requestNotificationPermissionIfNeeded()
-
-        // Check overlay permission on start
-        checkOverlayPermissionPrompt()
     }
 
     override fun onResume() {
         super.onResume()
+        loadSavedSettings()
+        updateLanguageChipUI()
+        updateBgStyleUI()
+        updateTextScaleUI()
         updateUIState()
     }
 
-    private fun setupLanguageSpinner() {
-        val languages = arrayOf(
-            getString(R.string.lang_japanese),
-            getString(R.string.lang_korean),
-            getString(R.string.lang_english)
-        )
-        val adapter = ArrayAdapter(this, R.layout.spinner_item, languages)
-        adapter.setDropDownViewResource(R.layout.spinner_dropdown_item)
-        binding.spinnerLang.adapter = adapter
-
-        val savedLang = prefs.getInt(PREF_KEY_LANG, 0)
-        binding.spinnerLang.setSelection(savedLang)
+    private fun loadSavedSettings() {
+        selectedLangIndex = prefs.getInt(PREF_KEY_LANG, 0).coerceIn(0, 3)
+        selectedBgStyle = prefs.getInt(PREF_KEY_BG_STYLE, OverlayView.STYLE_SEAMLESS_WHITE)
+        selectedTextScale = prefs.getFloat(PREF_KEY_TEXT_SCALE, 1.0f)
     }
 
-    private fun setupBgStyleSelector() {
-        val savedStyle = prefs.getInt(PREF_KEY_BG_STYLE, OverlayView.STYLE_TRANSPARENT)
-        if (savedStyle == OverlayView.STYLE_SEAMLESS_WHITE) {
-            binding.rbSeamlessWhite.isChecked = true
-        } else {
-            binding.rbTransparent.isChecked = true
-        }
+    private fun setupLanguageChips() {
+        binding.chipLangJa.setOnClickListener { selectLanguage(0) }
+        binding.chipLangKo.setOnClickListener { selectLanguage(1) }
+        binding.chipLangEn.setOnClickListener { selectLanguage(2) }
+        binding.chipLangZh.setOnClickListener { selectLanguage(3) }
+        updateLanguageChipUI()
+    }
 
-        binding.rgBgStyle.setOnCheckedChangeListener { _, checkedId ->
-            val style = if (checkedId == R.id.rbSeamlessWhite) {
-                OverlayView.STYLE_SEAMLESS_WHITE
-            } else {
-                OverlayView.STYLE_TRANSPARENT
+    private fun selectLanguage(index: Int) {
+        selectedLangIndex = index
+        prefs.edit().putInt(PREF_KEY_LANG, index).apply()
+        updateLanguageChipUI()
+
+        if (FloatingService.isRunning) {
+            val intent = Intent(this, FloatingService::class.java).apply {
+                action = FloatingService.ACTION_UPDATE_LANG
+                putExtra(FloatingService.EXTRA_LANG_INDEX, index)
             }
-            prefs.edit().putInt(PREF_KEY_BG_STYLE, style).apply()
+            startService(intent)
         }
+    }
+
+    private fun updateLanguageChipUI() {
+        val chips = listOf(
+            Triple(0, binding.chipLangJa, binding.tvLangJaTitle),
+            Triple(1, binding.chipLangKo, binding.tvLangKoTitle),
+            Triple(2, binding.chipLangEn, binding.tvLangEnTitle),
+            Triple(3, binding.chipLangZh, binding.tvLangZhTitle)
+        )
+        for ((idx, container, title) in chips) {
+            val isSelected = idx == selectedLangIndex
+            container.setBackgroundResource(
+                if (isSelected) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+            )
+            title.setTextColor(if (isSelected) Color.WHITE else Color.parseColor("#CFD8DC"))
+        }
+    }
+
+    private fun setupBgStyleCards() {
+        binding.cardBgSolid.setOnClickListener { selectBgStyle(OverlayView.STYLE_SEAMLESS_WHITE) }
+        binding.cardBgTransparent.setOnClickListener { selectBgStyle(OverlayView.STYLE_TRANSPARENT) }
+        updateBgStyleUI()
+    }
+
+    private fun selectBgStyle(style: Int) {
+        selectedBgStyle = style
+        prefs.edit().putInt(PREF_KEY_BG_STYLE, style).apply()
+        updateBgStyleUI()
+
+        if (FloatingService.isRunning) {
+            val updateIntent = Intent(this, FloatingService::class.java).apply {
+                action = FloatingService.ACTION_UPDATE_BG_STYLE
+                putExtra(FloatingService.EXTRA_BG_STYLE, style)
+            }
+            startService(updateIntent)
+        }
+    }
+
+    private fun updateBgStyleUI() {
+        val isSolid = selectedBgStyle == OverlayView.STYLE_SEAMLESS_WHITE
+        binding.cardBgSolid.setBackgroundResource(
+            if (isSolid) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+        )
+        binding.cardBgTransparent.setBackgroundResource(
+            if (!isSolid) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+        )
+        binding.tvBgSolidLabel.setTextColor(if (isSolid) Color.WHITE else Color.parseColor("#CFD8DC"))
+        binding.tvBgTransparentLabel.setTextColor(if (!isSolid) Color.WHITE else Color.parseColor("#CFD8DC"))
+    }
+
+    private fun setupTextScalePills() {
+        binding.chipScaleSmall.setOnClickListener { selectTextScale(0.85f) }
+        binding.chipScaleNormal.setOnClickListener { selectTextScale(1.0f) }
+        binding.chipScaleLarge.setOnClickListener { selectTextScale(1.2f) }
+        updateTextScaleUI()
+    }
+
+    private fun selectTextScale(scale: Float) {
+        selectedTextScale = scale
+        prefs.edit().putFloat(PREF_KEY_TEXT_SCALE, scale).apply()
+        updateTextScaleUI()
+
+        if (FloatingService.isRunning) {
+            val intent = Intent(this, FloatingService::class.java).apply {
+                action = FloatingService.ACTION_UPDATE_TEXT_SCALE
+                putExtra(FloatingService.EXTRA_TEXT_SCALE, scale)
+            }
+            startService(intent)
+        }
+    }
+
+    private fun updateTextScaleUI() {
+        val isSmall = selectedTextScale < 0.92f
+        val isLarge = selectedTextScale > 1.1f
+        val isNormal = !isSmall && !isLarge
+
+        binding.chipScaleSmall.setBackgroundResource(
+            if (isSmall) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+        )
+        binding.chipScaleNormal.setBackgroundResource(
+            if (isNormal) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+        )
+        binding.chipScaleLarge.setBackgroundResource(
+            if (isLarge) R.drawable.bg_chip_selected else R.drawable.bg_chip_unselected
+        )
+
+        binding.chipScaleSmall.setTextColor(if (isSmall) Color.WHITE else Color.parseColor("#CFD8DC"))
+        binding.chipScaleNormal.setTextColor(if (isNormal) Color.WHITE else Color.parseColor("#CFD8DC"))
+        binding.chipScaleLarge.setTextColor(if (isLarge) Color.WHITE else Color.parseColor("#CFD8DC"))
     }
 
     private fun setupButtons() {
@@ -127,14 +217,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            // Save selected language
-            val selectedLang = binding.spinnerLang.selectedItemPosition
-            prefs.edit().putInt(PREF_KEY_LANG, selectedLang).apply()
-
-            // Pre-download translator models in background so they are ready
-            preDownloadLanguageModel(selectedLang)
-
-            // Request Screen Capture
+            preDownloadLanguageModel(selectedLangIndex)
             screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
 
@@ -145,10 +228,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun preDownloadLanguageModel(langIndex: Int) {
         val languagesToPreload = listOf(
-            TranslateLanguage.ENGLISH, // Always ensure English is ready (most popular for web scans)
+            TranslateLanguage.ENGLISH,
             when (langIndex) {
                 0 -> TranslateLanguage.JAPANESE
                 1 -> TranslateLanguage.KOREAN
+                3 -> TranslateLanguage.CHINESE
                 else -> TranslateLanguage.ENGLISH
             }
         ).distinct()
@@ -175,16 +259,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun checkOverlayPermissionPrompt() {
-        if (!hasOverlayPermission()) {
-            Toast.makeText(
-                this,
-                "Mohon berikan izin 'Tampilkan di atas aplikasi lain' untuk menggunakan tombol melayang.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
     private fun openOverlaySettings() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val intent = Intent(
@@ -208,18 +282,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchFloatingService(resultCode: Int, resultData: Intent) {
-        val selectedLang = binding.spinnerLang.selectedItemPosition
-        val bgStyle = if (binding.rbSeamlessWhite.isChecked) {
-            OverlayView.STYLE_SEAMLESS_WHITE
-        } else {
-            OverlayView.STYLE_TRANSPARENT
-        }
-
         val serviceIntent = Intent(this, FloatingService::class.java).apply {
             putExtra(FloatingService.EXTRA_RESULT_CODE, resultCode)
             putExtra(FloatingService.EXTRA_RESULT_DATA, resultData)
-            putExtra(FloatingService.EXTRA_LANG_INDEX, selectedLang)
-            putExtra(FloatingService.EXTRA_BG_STYLE, bgStyle)
+            putExtra(FloatingService.EXTRA_LANG_INDEX, selectedLangIndex)
+            putExtra(FloatingService.EXTRA_BG_STYLE, selectedBgStyle)
+            putExtra(FloatingService.EXTRA_TEXT_SCALE, selectedTextScale)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -235,8 +303,6 @@ class MainActivity : AppCompatActivity() {
         ).show()
 
         updateUIState()
-
-        // Move to background so user can go read comics immediately
         moveTaskToBack(true)
     }
 
@@ -246,31 +312,27 @@ class MainActivity : AppCompatActivity() {
         }
         startService(stopIntent)
 
-        Toast.makeText(this, "Layanan tombol melayang telah dihentikan.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Layanan tombol melayang dihentikan.", Toast.LENGTH_SHORT).show()
         updateUIState()
     }
 
     private fun updateUIState() {
         val overlayGranted = hasOverlayPermission()
-        if (overlayGranted) {
-            binding.tvOverlayStatus.text = getString(R.string.overlay_granted)
-            binding.tvOverlayStatus.setTextColor(Color.parseColor("#4CAF50"))
-            binding.btnGrantOverlay.visibility = View.GONE
-        } else {
-            binding.tvOverlayStatus.text = "Izin Overlay Belum Aktif ⚠"
-            binding.tvOverlayStatus.setTextColor(Color.parseColor("#FF5252"))
-            binding.btnGrantOverlay.visibility = View.VISIBLE
-        }
+        binding.cardOverlayAlert.visibility = if (overlayGranted) View.GONE else View.VISIBLE
 
         val serviceRunning = FloatingService.isRunning
         if (serviceRunning) {
-            binding.tvServiceStatus.text = getString(R.string.status_service_running)
-            binding.tvServiceStatus.setTextColor(Color.parseColor("#4CAF50"))
-            binding.btnStartFloating.text = "Layanan Sedang Berjalan (Ketuk untuk Refresh)"
+            binding.llStatusPill.setBackgroundResource(R.drawable.bg_status_active)
+            binding.viewStatusDot.setBackgroundResource(R.drawable.bg_auto_dot_on)
+            binding.tvServiceStatus.text = "Aktif"
+            binding.tvServiceStatus.setTextColor(Color.parseColor("#00E676"))
+            binding.btnStartFloating.text = "Refresh Izin Layar"
             binding.btnStopFloating.visibility = View.VISIBLE
         } else {
-            binding.tvServiceStatus.text = getString(R.string.status_service_stopped)
-            binding.tvServiceStatus.setTextColor(Color.parseColor("#FF7043"))
+            binding.llStatusPill.setBackgroundResource(R.drawable.bg_status_idle)
+            binding.viewStatusDot.setBackgroundResource(R.drawable.bg_auto_dot_off)
+            binding.tvServiceStatus.text = "Siap"
+            binding.tvServiceStatus.setTextColor(Color.parseColor("#FFB74D"))
             binding.btnStartFloating.text = getString(R.string.btn_start_service)
             binding.btnStopFloating.visibility = View.GONE
         }

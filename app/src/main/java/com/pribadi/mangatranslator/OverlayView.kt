@@ -25,7 +25,7 @@ class OverlayView @JvmOverloads constructor(
 
     companion object {
         const val STYLE_TRANSPARENT = 0      // No background card, comic outline halo
-        const val STYLE_SEAMLESS_WHITE = 1   // Seamless white bubble patch (no border)
+        const val STYLE_SEAMLESS_WHITE = 1   // Solid high-opacity background covering original text
     }
 
     private class PreparedBlock(
@@ -34,9 +34,12 @@ class OverlayView @JvmOverloads constructor(
         val strokeLayout: StaticLayout,
         val fillPaint: TextPaint,
         val strokePaint: TextPaint,
+        val bgColor: Int,
+        val isLightBg: Boolean,
         val baseDrawX: Float,
         var baseDrawY: Float,
-        val basePatchRect: RectF
+        val basePatchRect: RectF,
+        val cornerRadius: Float
     )
 
     private val blocksLock = Any()
@@ -44,7 +47,12 @@ class OverlayView @JvmOverloads constructor(
     @Volatile
     private var preparedBlocks: List<PreparedBlock> = emptyList()
 
-    var bgStyle: Int = STYLE_TRANSPARENT
+    @Volatile
+    var bgStyle: Int = STYLE_SEAMLESS_WHITE
+
+    @Volatile
+    var textScale: Float = 1.0f
+        private set
 
     @Volatile
     var targetShiftY: Float = 0f
@@ -52,10 +60,6 @@ class OverlayView @JvmOverloads constructor(
 
     @Volatile
     var velocityPxPerMs: Float = 0f
-        private set
-
-    @Volatile
-    var lastUpdateNano: Long = 0L
         private set
 
     @Volatile
@@ -74,15 +78,41 @@ class OverlayView @JvmOverloads constructor(
     }
 
     private val baseFillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.BLACK
+        color = Color.rgb(17, 17, 17)
         style = Paint.Style.FILL
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         isAntiAlias = true
     }
 
-    private val seamlessWhitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val solidBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.FILL
+        alpha = 255
+    }
+
+    fun setBackgroundStyle(newStyle: Int) {
+        if (bgStyle == newStyle) return
+        bgStyle = newStyle
+        rebuildPreparedBlocks()
+    }
+
+    fun setTextScale(newScale: Float) {
+        val clamped = newScale.coerceIn(0.75f, 1.35f)
+        if (abs(textScale - clamped) < 0.01f) return
+        textScale = clamped
+        rebuildPreparedBlocks()
+    }
+
+    private fun rebuildPreparedBlocks() {
+        val viewWidth = effectiveWidth()
+        val viewHeight = effectiveHeight()
+        synchronized(blocksLock) {
+            if (preparedBlocks.isNotEmpty()) {
+                val rebuilt = preparedBlocks.mapNotNull { prepareBlock(it.block, viewWidth) }
+                preparedBlocks = resolveOverlapsAndPrune(rebuilt, viewHeight, targetShiftY)
+            }
+        }
+        postInvalidateOnAnimation()
     }
 
     /**
@@ -103,9 +133,8 @@ class OverlayView @JvmOverloads constructor(
     fun updateScrollState(newShiftY: Float, velocity: Float) {
         targetShiftY = newShiftY
         velocityPxPerMs = velocity
-        lastUpdateNano = System.nanoTime()
         pruneScrolledPastBlocks(newShiftY)
-        if (abs(newShiftY - renderedShiftY) > 0.15f) {
+        if (abs(newShiftY - renderedShiftY) > 0.2f) {
             postInvalidateOnAnimation()
         }
     }
@@ -113,7 +142,6 @@ class OverlayView @JvmOverloads constructor(
     fun resetScrollState(initialShiftY: Float = 0f) {
         targetShiftY = initialShiftY
         velocityPxPerMs = 0f
-        lastUpdateNano = System.nanoTime()
         renderedShiftY = initialShiftY
         prevRenderedShiftY = initialShiftY
     }
@@ -127,42 +155,25 @@ class OverlayView @JvmOverloads constructor(
 
     fun hasBlocks(): Boolean = preparedBlocks.isNotEmpty()
 
-    fun hasVisibleBlocksAt(atShiftY: Float): Boolean {
-        val snapshot = preparedBlocks
-        if (snapshot.isEmpty()) return false
-        val screenHeight = effectiveHeight()
-        val topLimit = screenHeight * 0.045f
-        val bottomLimit = screenHeight * 0.945f
-        for (item in snapshot) {
-            val deltaY = atShiftY - item.block.captureShiftY
-            val curTop = item.basePatchRect.top + deltaY
-            val curBottom = item.basePatchRect.bottom + deltaY
-            if (curTop >= topLimit && curBottom <= bottomLimit) {
-                return true
-            }
-        }
-        return false
-    }
-
     /**
-     * Permanently removes any block that has scrolled past the visible top/bottom reading area
-     * so scrolled-past bubbles disappear immediately and never stack or come back.
+     * Permanently removes any block once it has completely scrolled past the top or bottom
+     * reading boundary so scrolled-past bubbles disappear and never stack or reappear.
      */
     private fun pruneScrolledPastBlocks(atShiftY: Float) {
         val snapshot = preparedBlocks
         if (snapshot.isEmpty()) return
 
         val screenHeight = effectiveHeight()
-        val topLimit = screenHeight * 0.04f
-        val bottomLimit = screenHeight * 0.95f
-        val maxTravel = screenHeight * 0.72f
+        val topExitThreshold = screenHeight * 0.055f
+        val bottomExitThreshold = screenHeight * 0.94f
+        val maxTravel = screenHeight * 0.85f
 
         var anyRemoved = false
         for (item in snapshot) {
             val deltaY = atShiftY - item.block.captureShiftY
             val curTop = item.basePatchRect.top + deltaY
             val curBottom = item.basePatchRect.bottom + deltaY
-            if (curTop < topLimit || curBottom > bottomLimit || abs(deltaY) > maxTravel) {
+            if (curBottom < topExitThreshold || curTop > bottomExitThreshold || abs(deltaY) > maxTravel) {
                 anyRemoved = true
                 break
             }
@@ -174,7 +185,9 @@ class OverlayView @JvmOverloads constructor(
                     val deltaY = atShiftY - item.block.captureShiftY
                     val curTop = item.basePatchRect.top + deltaY
                     val curBottom = item.basePatchRect.bottom + deltaY
-                    curTop >= topLimit && curBottom <= bottomLimit && abs(deltaY) <= maxTravel
+                    curBottom >= topExitThreshold &&
+                        curTop <= bottomExitThreshold &&
+                        abs(deltaY) <= maxTravel
                 }
             }
         }
@@ -184,7 +197,7 @@ class OverlayView @JvmOverloads constructor(
      * Returns swept screen-space bounding rectangles covering both previous/rendered and
      * current/target scroll offsets so [ScrollTracker] ignores overlay rendering completely.
      */
-    fun getMaskedScreenRects(atShiftY: Float, extraPadding: Int = 12): List<Rect> {
+    fun getMaskedScreenRects(atShiftY: Float, extraPadding: Int = 14): List<Rect> {
         val snapshot = preparedBlocks
         if (snapshot.isEmpty()) return emptyList()
 
@@ -227,69 +240,75 @@ class OverlayView @JvmOverloads constructor(
         var snapshot = preparedBlocks
         if (snapshot.isEmpty()) return
 
+        val screenWidth = effectiveWidth()
         val screenHeight = effectiveHeight()
 
+        // Smooth, critically-damped tracking (no velocity overshoot / bounce-back)
         prevRenderedShiftY = renderedShiftY
-        val nowNano = System.nanoTime()
-        val dtMs = ((nowNano - lastUpdateNano) / 1_000_000f).coerceIn(0f, 24f)
         val target = targetShiftY
-        val vel = velocityPxPerMs
-
-        if (abs(vel) > 0.06f && dtMs < 20f) {
-            val predictedShiftY = target + vel * (dtMs * 0.55f)
-            renderedShiftY += (predictedShiftY - renderedShiftY) * 0.80f
-            postInvalidateOnAnimation()
+        val diff = target - renderedShiftY
+        if (abs(diff) <= 0.5f) {
+            renderedShiftY = target
         } else {
-            val diff = target - renderedShiftY
-            if (abs(diff) < 0.35f) {
-                renderedShiftY = target
-            } else {
-                renderedShiftY += diff * 0.72f
-                postInvalidateOnAnimation()
-            }
+            renderedShiftY += diff * 0.85f
+            postInvalidateOnAnimation()
         }
 
-        // Permanently prune any block that has scrolled past the top/bottom reading bounds
         pruneScrolledPastBlocks(renderedShiftY)
         snapshot = preparedBlocks
         if (snapshot.isEmpty()) return
 
-        val topFadeZone = screenHeight * 0.065f
-        val bottomFadeZone = screenHeight * 0.925f
-        val topFadeHalf = (topFadeZone * 0.6f).coerceAtLeast(16f)
-        val topFadeRange = (topFadeZone * 0.7f).coerceAtLeast(20f)
-        val bottomMarginHalf = ((screenHeight - bottomFadeZone) * 0.6f).coerceAtLeast(16f)
-        val bottomFadeRange = ((screenHeight - bottomFadeZone) * 0.7f).coerceAtLeast(20f)
+        // Clip cleanly inside system status bar and navigation bar so scrolled bubbles glide out smoothly
+        val topClip = screenHeight * 0.045f
+        val bottomClip = screenHeight * 0.945f
+        val fadeBand = (screenHeight * 0.03f).coerceAtLeast(20f)
+        val currentStyle = bgStyle
+
+        canvas.save()
+        canvas.clipRect(0f, topClip, screenWidth, bottomClip)
 
         for (item in snapshot) {
             val deltaY = renderedShiftY - item.block.captureShiftY
             val curTop = item.basePatchRect.top + deltaY
             val curBottom = item.basePatchRect.bottom + deltaY
-            if (curBottom < 0f || curTop > screenHeight) continue
+            if (curBottom <= topClip || curTop >= bottomClip) continue
 
-            val curCenterY = (curTop + curBottom) * 0.5f
-            val topFactor = ((curCenterY - topFadeHalf) / topFadeRange).coerceIn(0f, 1f)
-            val bottomFactor = (((screenHeight - bottomMarginHalf) - curCenterY) / bottomFadeRange)
-                .coerceIn(0f, 1f)
-            val alpha = (minOf(topFactor, bottomFactor) * 255f).roundToInt().coerceIn(0, 255)
+            // Keep 100% solid opacity (alpha = 255) across the reading area; only fade gently
+            // right as the bubble exits past the very top/bottom edge.
+            val topVis = ((curBottom - topClip) / fadeBand).coerceIn(0f, 1f)
+            val botVis = ((bottomClip - curTop) / fadeBand).coerceIn(0f, 1f)
+            val alpha = (minOf(topVis, botVis) * 255f).roundToInt().coerceIn(0, 255)
             if (alpha <= 5) continue
 
             canvas.save()
             canvas.translate(0f, deltaY)
 
-            if (bgStyle == STYLE_SEAMLESS_WHITE) {
-                seamlessWhitePaint.alpha = alpha
-                canvas.drawRoundRect(item.basePatchRect, 10f, 10f, seamlessWhitePaint)
+            if (currentStyle == STYLE_SEAMLESS_WHITE) {
+                // High-opacity (100% opaque) solid fill covering all original foreign text
+                solidBgPaint.color = item.bgColor
+                solidBgPaint.alpha = alpha
+                canvas.drawRoundRect(
+                    item.basePatchRect,
+                    item.cornerRadius,
+                    item.cornerRadius,
+                    solidBgPaint
+                )
+
+                item.fillPaint.alpha = alpha
+                canvas.translate(item.baseDrawX, item.baseDrawY)
+                item.fillLayout.draw(canvas)
+            } else {
+                item.strokePaint.alpha = alpha
+                item.fillPaint.alpha = alpha
+                canvas.translate(item.baseDrawX, item.baseDrawY)
+                item.strokeLayout.draw(canvas)
+                item.fillLayout.draw(canvas)
             }
 
-            item.strokePaint.alpha = alpha
-            item.fillPaint.alpha = alpha
-
-            canvas.translate(item.baseDrawX, item.baseDrawY)
-            item.strokeLayout.draw(canvas)
-            item.fillLayout.draw(canvas)
             canvas.restore()
         }
+
+        canvas.restore()
     }
 
     /**
@@ -303,14 +322,14 @@ class OverlayView @JvmOverloads constructor(
     ): List<PreparedBlock> {
         if (items.isEmpty()) return emptyList()
 
-        val topLimit = screenHeight * 0.04f
-        val bottomLimit = screenHeight * 0.95f
+        val topLimit = screenHeight * 0.045f
+        val bottomLimit = screenHeight * 0.945f
 
         val visible = items.filter { item ->
             val deltaY = atShiftY - item.block.captureShiftY
             val curTop = item.basePatchRect.top + deltaY
             val curBottom = item.basePatchRect.bottom + deltaY
-            curTop >= topLimit && curBottom <= bottomLimit
+            curBottom >= topLimit + 10f && curTop <= bottomLimit - 10f
         }.sortedBy { it.basePatchRect.top }
 
         if (visible.size <= 1) return visible
@@ -328,7 +347,6 @@ class OverlayView @JvmOverloads constructor(
 
             if (duplicateIdx >= 0) {
                 val existing = deduplicated[duplicateIdx]
-                // Keep the one with longer/more complete translated text
                 if (candidate.block.translatedText.length > existing.block.translatedText.length) {
                     deduplicated[duplicateIdx] = candidate
                 }
@@ -337,15 +355,15 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // Separate any slightly touching vertical neighbors so their boxes never overlap
+        // Separate any slightly touching vertical neighbors so their patches never overlap
         for (i in 0 until deduplicated.size - 1) {
             val upper = deduplicated[i]
             val lower = deduplicated[i + 1]
             val horizOverlap = minOf(upper.basePatchRect.right, lower.basePatchRect.right) -
                 maxOf(upper.basePatchRect.left, lower.basePatchRect.left)
-            if (horizOverlap > 12f) {
+            if (horizOverlap > 10f) {
                 val verticalOverlap = (upper.basePatchRect.bottom + 4f) - lower.basePatchRect.top
-                if (verticalOverlap > 0f && verticalOverlap < 60f) {
+                if (verticalOverlap > 0f && verticalOverlap < 70f) {
                     val push = verticalOverlap * 0.5f
                     upper.baseDrawY -= push
                     upper.basePatchRect.offset(0f, -push)
@@ -390,17 +408,30 @@ class OverlayView @JvmOverloads constructor(
         val centerX = box.centerX().toFloat()
         val centerY = box.centerY().toFloat()
 
-        val maxAvailWidth = (screenWidth - 24f).toInt().coerceAtLeast(100)
-        val availableWidth = maxOf((box.width() * 0.88f), 100f)
+        val maxAvailWidth = (screenWidth - 28f).toInt().coerceAtLeast(110)
+        val availableWidth = maxOf((box.width() * 0.90f), 110f)
             .toInt()
             .coerceAtMost(maxAvailWidth)
-        val availableHeight = maxOf((box.height() * 0.88f), 40f)
+        val availableHeight = maxOf((box.height() * 0.90f), 44f)
 
-        val fillPaint = TextPaint(baseFillPaint)
-        var textSize = minOf(30f, maxOf(16f, box.height() * 0.38f))
+        val bgColor = block.bubbleBgColor or (0xFF shl 24) // Enforce 100% opaque RGB
+        val isLightBg = SpeechBubbleDetector.isLightColor(bgColor)
+
+        val fillPaint = TextPaint(baseFillPaint).apply {
+            color = if (bgStyle == STYLE_SEAMLESS_WHITE && !isLightBg) {
+                Color.WHITE
+            } else {
+                Color.rgb(17, 17, 17)
+            }
+        }
+
+        val scale = textScale
+        val minTextSize = (11.5f * scale).coerceAtLeast(10f)
+        val maxTextSize = (32f * scale).coerceAtMost(42f)
+        var textSize = minOf(maxTextSize, maxOf(16f * scale, box.height() * 0.36f * scale))
         var selectedLayout: StaticLayout? = null
 
-        while (textSize >= 12f) {
+        while (textSize >= minTextSize) {
             fillPaint.textSize = textSize
             val layout = StaticLayout.Builder.obtain(
                 text,
@@ -422,8 +453,9 @@ class OverlayView @JvmOverloads constructor(
 
         val fillLayout = selectedLayout ?: return null
         val strokePaint = TextPaint(baseStrokePaint).apply {
+            this.color = if (isLightBg) Color.WHITE else Color.rgb(18, 18, 22)
             this.textSize = textSize
-            this.strokeWidth = maxOf(4f, textSize * 0.22f)
+            this.strokeWidth = maxOf(4.5f, textSize * 0.24f)
         }
         val strokeLayout = StaticLayout.Builder.obtain(
             text,
@@ -440,30 +472,26 @@ class OverlayView @JvmOverloads constructor(
         val layoutHeight = fillLayout.height.toFloat()
 
         val rawDrawX = centerX - (layoutWidth / 2f)
-        val baseDrawX = rawDrawX.coerceIn(8f, (screenWidth - layoutWidth - 8f).coerceAtLeast(8f))
+        val baseDrawX = rawDrawX.coerceIn(10f, (screenWidth - layoutWidth - 10f).coerceAtLeast(10f))
         val baseDrawY = centerY - (layoutHeight / 2f)
 
-        val pad = 6f
+        // Ensure solid background patch ALWAYS covers 100% of original foreign text + translated text
         val textRect = RectF(
-            baseDrawX - pad,
-            baseDrawY - pad,
-            baseDrawX + layoutWidth + pad,
-            baseDrawY + layoutHeight + pad
+            baseDrawX - 10f,
+            baseDrawY - 8f,
+            baseDrawX + layoutWidth + 10f,
+            baseDrawY + layoutHeight + 8f
         )
-        val origRect = RectF(block.boundingBox).apply { inset(-4f, -4f) }
-        val basePatchRect = RectF(textRect).apply { union(origRect) }
-
-        if (block.bubbleBox != null) {
-            val innerBubble = RectF(block.bubbleBox)
-            if (innerBubble.width() > 12f && innerBubble.height() > 12f) {
-                innerBubble.inset(3f, 3f)
-                basePatchRect.left = maxOf(basePatchRect.left, innerBubble.left)
-                basePatchRect.top = maxOf(basePatchRect.top, innerBubble.top)
-                basePatchRect.right = minOf(basePatchRect.right, innerBubble.right)
-                basePatchRect.bottom = minOf(basePatchRect.bottom, innerBubble.bottom)
-                basePatchRect.union(textRect)
-            }
+        val origRect = RectF(block.boundingBox).apply {
+            inset(-10f, -10f)
         }
+        val basePatchRect = RectF(origRect).apply { union(textRect) }
+
+        // Keep patch safely inside screen width without ever cutting into original foreign text
+        basePatchRect.left = basePatchRect.left.coerceAtLeast(4f)
+        basePatchRect.right = basePatchRect.right.coerceAtMost(screenWidth - 4f)
+
+        val cornerRadius = minOf(16f, basePatchRect.height() * 0.25f).coerceAtLeast(8f)
 
         return PreparedBlock(
             block = block,
@@ -471,9 +499,12 @@ class OverlayView @JvmOverloads constructor(
             strokeLayout = strokeLayout,
             fillPaint = fillPaint,
             strokePaint = strokePaint,
+            bgColor = bgColor,
+            isLightBg = isLightBg,
             baseDrawX = baseDrawX,
             baseDrawY = baseDrawY,
-            basePatchRect = basePatchRect
+            basePatchRect = basePatchRect,
+            cornerRadius = cornerRadius
         )
     }
 

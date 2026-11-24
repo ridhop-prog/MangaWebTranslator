@@ -1,5 +1,6 @@
 package com.pribadi.mangatranslator
 
+import android.graphics.Color
 import android.graphics.Rect
 
 data class TranslatedBlock(
@@ -7,5 +8,6 @@ data class TranslatedBlock(
     val translatedText: String,
     val bubbleBox: Rect? = null,
     val captureShiftY: Float = 0f,
-    val originalText: String = ""
+    val originalText: String = "",
+    val bubbleBgColor: Int = Color.WHITE
 )
