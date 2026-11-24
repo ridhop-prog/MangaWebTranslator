@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Build Debug APK
+    name: Build Release APK
     runs-on: ubuntu-latest
 
     steps:
@@ -26,11 +26,11 @@ jobs:
           gradle-version: '8.4'
           cache-disabled: true
 
-      - name: Build APK with Gradle
-        run: gradle assembleDebug --stacktrace
+      - name: Build Optimized Release APK with Gradle
+        run: gradle assembleRelease --stacktrace
 
-      - name: Upload Debug APK Artifact
+      - name: Upload Optimized APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ScreenMangaTranslator-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/release/app-release.apk

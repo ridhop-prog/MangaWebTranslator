@@ -11,18 +11,58 @@ android {
         applicationId = "com.pribadi.mangatranslator"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Only package ARM native libraries for real Android devices (removes ~55 MB of x86/x86_64 emulator libs)
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+
+        // Only keep Indonesian and English AndroidX/Material string resources
+        resourceConfigurations += listOf("in", "id", "en")
+    }
+
+    signingConfigs {
+        create("consistent") {
+            storeFile = file("manga-translator.jks")
+            storePassword = "manga2026sign"
+            keyAlias = "mangatranslator"
+            keyPassword = "manga2026sign"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("consistent")
+        }
         release {
-            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("consistent")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
+            )
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Compress native ML Kit .so libraries inside the APK (cuts ~60% of native lib size)
+            useLegacyPackaging = true
+        }
+        resources {
+            excludes += listOf(
+                "META-INF/*.kotlin_module",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "DebugProbesKt.bin"
             )
         }
     }
@@ -53,6 +93,6 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-korean:16.0.1")
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 
-    // ML Kit Translation
+    // ML Kit Translation (Offline fallback)
     implementation("com.google.mlkit:translate:17.0.3")
 }
