@@ -428,7 +428,7 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            android:text="BG Solid 100%"
+                            android:text="BG Putih 100%"
                             android:textColor="#FFFFFF"
                             android:textSize="12sp"
                             android:textStyle="bold" />
@@ -437,7 +437,7 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="Menutupi teks asli"
+                            android:text="Tutup bubble asli"
                             android:textColor="#9AA4C2"
                             android:textSize="10sp" />
                     </LinearLayout>

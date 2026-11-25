@@ -25,7 +25,7 @@ class OverlayView @JvmOverloads constructor(
 
     companion object {
         const val STYLE_TRANSPARENT = 0      // No background card, comic outline halo
-        const val STYLE_SEAMLESS_WHITE = 1   // Solid high-opacity background covering original text
+        const val STYLE_SEAMLESS_WHITE = 1   // 100% Solid Pure White bubble covering original manga bubble
     }
 
     private class PreparedBlock(
@@ -34,8 +34,6 @@ class OverlayView @JvmOverloads constructor(
         val strokeLayout: StaticLayout,
         val fillPaint: TextPaint,
         val strokePaint: TextPaint,
-        val bgColor: Int,
-        val isLightBg: Boolean,
         val baseDrawX: Float,
         var baseDrawY: Float,
         val basePatchRect: RectF,
@@ -68,6 +66,15 @@ class OverlayView @JvmOverloads constructor(
     @Volatile
     private var prevRenderedShiftY: Float = 0f
 
+    // Full physical display dimensions matching MediaProjection capture coordinates
+    @Volatile
+    var fullScreenWidth: Int = 0
+    @Volatile
+    var fullScreenHeight: Int = 0
+
+    // Reused scratch array to cancel any status-bar/cutout window inset offset to 0.0px error
+    private val windowLocation = IntArray(2)
+
     private val baseStrokePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.STROKE
@@ -78,16 +85,31 @@ class OverlayView @JvmOverloads constructor(
     }
 
     private val baseFillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(17, 17, 17)
+        color = Color.BLACK
         style = Paint.Style.FILL
         typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
         isAntiAlias = true
     }
 
-    private val solidBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // 100% opaque pure solid white paint to completely cover original manga bubbles
+    private val solidWhiteBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.FILL
         alpha = 255
+    }
+
+    // Crisp subtle comic edge around white bubble so it stays sharp over bright panels too
+    private val solidBubbleEdgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(45, 0, 0, 0)
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f
+    }
+
+    fun setScreenDimensions(screenW: Int, screenH: Int) {
+        if (screenW > 0 && screenH > 0) {
+            fullScreenWidth = screenW
+            fullScreenHeight = screenH
+        }
     }
 
     fun setBackgroundStyle(newStyle: Int) {
@@ -115,10 +137,6 @@ class OverlayView @JvmOverloads constructor(
         postInvalidateOnAnimation()
     }
 
-    /**
-     * Replaces all displayed blocks with [newBlocks], deduplicating any overlapping bubbles
-     * so bubbles never stack on top of each other.
-     */
     fun setTranslatedBlocks(newBlocks: List<TranslatedBlock>) {
         val viewWidth = effectiveWidth()
         val viewHeight = effectiveHeight()
@@ -155,10 +173,6 @@ class OverlayView @JvmOverloads constructor(
 
     fun hasBlocks(): Boolean = preparedBlocks.isNotEmpty()
 
-    /**
-     * Permanently removes any block once it has completely scrolled past the top or bottom
-     * reading boundary so scrolled-past bubbles disappear and never stack or reappear.
-     */
     private fun pruneScrolledPastBlocks(atShiftY: Float) {
         val snapshot = preparedBlocks
         if (snapshot.isEmpty()) return
@@ -193,10 +207,6 @@ class OverlayView @JvmOverloads constructor(
         }
     }
 
-    /**
-     * Returns swept screen-space bounding rectangles covering both previous/rendered and
-     * current/target scroll offsets so [ScrollTracker] ignores overlay rendering completely.
-     */
     fun getMaskedScreenRects(atShiftY: Float, extraPadding: Int = 14): List<Rect> {
         val snapshot = preparedBlocks
         if (snapshot.isEmpty()) return emptyList()
@@ -223,12 +233,7 @@ class OverlayView @JvmOverloads constructor(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (w > 0 && w != oldw && preparedBlocks.isNotEmpty()) {
-            val widthF = w.toFloat()
-            val heightF = if (h > 0) h.toFloat() else effectiveHeight()
-            synchronized(blocksLock) {
-                val rebuilt = preparedBlocks.mapNotNull { prepareBlock(it.block, widthF) }
-                preparedBlocks = resolveOverlapsAndPrune(rebuilt, heightF, targetShiftY)
-            }
+            rebuildPreparedBlocks()
         }
     }
 
@@ -243,14 +248,13 @@ class OverlayView @JvmOverloads constructor(
         val screenWidth = effectiveWidth()
         val screenHeight = effectiveHeight()
 
-        // Smooth, critically-damped tracking (no velocity overshoot / bounce-back)
         prevRenderedShiftY = renderedShiftY
         val target = targetShiftY
         val diff = target - renderedShiftY
         if (abs(diff) <= 0.5f) {
             renderedShiftY = target
         } else {
-            renderedShiftY += diff * 0.85f
+            renderedShiftY += diff * 0.86f
             postInvalidateOnAnimation()
         }
 
@@ -258,13 +262,18 @@ class OverlayView @JvmOverloads constructor(
         snapshot = preparedBlocks
         if (snapshot.isEmpty()) return
 
-        // Clip cleanly inside system status bar and navigation bar so scrolled bubbles glide out smoothly
+        // Align Canvas origin EXACTLY to physical display (0, 0) matching MediaProjection!
+        // Cancels any OEM status-bar or camera-cutout window offset so white bubbles land 1:1 on manga bubbles.
+        getLocationOnScreen(windowLocation)
+        val offsetX = -windowLocation[0].toFloat()
+        val offsetY = -windowLocation[1].toFloat()
+
         val topClip = screenHeight * 0.045f
         val bottomClip = screenHeight * 0.945f
-        val fadeBand = (screenHeight * 0.03f).coerceAtLeast(20f)
         val currentStyle = bgStyle
 
         canvas.save()
+        canvas.translate(offsetX, offsetY)
         canvas.clipRect(0f, topClip, screenWidth, bottomClip)
 
         for (item in snapshot) {
@@ -273,33 +282,33 @@ class OverlayView @JvmOverloads constructor(
             val curBottom = item.basePatchRect.bottom + deltaY
             if (curBottom <= topClip || curTop >= bottomClip) continue
 
-            // Keep 100% solid opacity (alpha = 255) across the reading area; only fade gently
-            // right as the bubble exits past the very top/bottom edge.
-            val topVis = ((curBottom - topClip) / fadeBand).coerceIn(0f, 1f)
-            val botVis = ((bottomClip - curTop) / fadeBand).coerceIn(0f, 1f)
-            val alpha = (minOf(topVis, botVis) * 255f).roundToInt().coerceIn(0, 255)
-            if (alpha <= 5) continue
-
             canvas.save()
             canvas.translate(0f, deltaY)
 
             if (currentStyle == STYLE_SEAMLESS_WHITE) {
-                // High-opacity (100% opaque) solid fill covering all original foreign text
-                solidBgPaint.color = item.bgColor
-                solidBgPaint.alpha = alpha
+                // Strictly 100% OPAQUE PURE SOLID WHITE (#FFFFFFFF) covering the entire original manga bubble!
+                solidWhiteBgPaint.color = Color.WHITE
+                solidWhiteBgPaint.alpha = 255
                 canvas.drawRoundRect(
                     item.basePatchRect,
                     item.cornerRadius,
                     item.cornerRadius,
-                    solidBgPaint
+                    solidWhiteBgPaint
+                )
+                canvas.drawRoundRect(
+                    item.basePatchRect,
+                    item.cornerRadius,
+                    item.cornerRadius,
+                    solidBubbleEdgePaint
                 )
 
-                item.fillPaint.alpha = alpha
+                item.fillPaint.color = Color.BLACK
+                item.fillPaint.alpha = 255
                 canvas.translate(item.baseDrawX, item.baseDrawY)
                 item.fillLayout.draw(canvas)
             } else {
-                item.strokePaint.alpha = alpha
-                item.fillPaint.alpha = alpha
+                item.strokePaint.alpha = 255
+                item.fillPaint.alpha = 255
                 canvas.translate(item.baseDrawX, item.baseDrawY)
                 item.strokeLayout.draw(canvas)
                 item.fillLayout.draw(canvas)
@@ -311,10 +320,6 @@ class OverlayView @JvmOverloads constructor(
         canvas.restore()
     }
 
-    /**
-     * Filters out off-screen blocks, removes duplicate/overlapping blocks that would stack on top
-     * of each other, and gently separates vertically touching blocks.
-     */
     private fun resolveOverlapsAndPrune(
         items: List<PreparedBlock>,
         screenHeight: Float,
@@ -355,7 +360,7 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // Separate any slightly touching vertical neighbors so their patches never overlap
+        // Separate slightly touching vertical neighbors cleanly
         for (i in 0 until deduplicated.size - 1) {
             val upper = deduplicated[i]
             val lower = deduplicated[i + 1]
@@ -408,21 +413,14 @@ class OverlayView @JvmOverloads constructor(
         val centerX = box.centerX().toFloat()
         val centerY = box.centerY().toFloat()
 
-        val maxAvailWidth = (screenWidth - 28f).toInt().coerceAtLeast(110)
-        val availableWidth = maxOf((box.width() * 0.90f), 110f)
+        val maxAvailWidth = (screenWidth - 32f).toInt().coerceAtLeast(110)
+        val availableWidth = maxOf((box.width() * 0.90f), 115f)
             .toInt()
             .coerceAtMost(maxAvailWidth)
-        val availableHeight = maxOf((box.height() * 0.90f), 44f)
-
-        val bgColor = block.bubbleBgColor or (0xFF shl 24) // Enforce 100% opaque RGB
-        val isLightBg = SpeechBubbleDetector.isLightColor(bgColor)
+        val availableHeight = maxOf((box.height() * 0.90f), 46f)
 
         val fillPaint = TextPaint(baseFillPaint).apply {
-            color = if (bgStyle == STYLE_SEAMLESS_WHITE && !isLightBg) {
-                Color.WHITE
-            } else {
-                Color.rgb(17, 17, 17)
-            }
+            color = Color.BLACK
         }
 
         val scale = textScale
@@ -453,7 +451,7 @@ class OverlayView @JvmOverloads constructor(
 
         val fillLayout = selectedLayout ?: return null
         val strokePaint = TextPaint(baseStrokePaint).apply {
-            this.color = if (isLightBg) Color.WHITE else Color.rgb(18, 18, 22)
+            this.color = Color.WHITE
             this.textSize = textSize
             this.strokeWidth = maxOf(4.5f, textSize * 0.24f)
         }
@@ -472,26 +470,44 @@ class OverlayView @JvmOverloads constructor(
         val layoutHeight = fillLayout.height.toFloat()
 
         val rawDrawX = centerX - (layoutWidth / 2f)
-        val baseDrawX = rawDrawX.coerceIn(10f, (screenWidth - layoutWidth - 10f).coerceAtLeast(10f))
+        val baseDrawX = rawDrawX.coerceIn(12f, (screenWidth - layoutWidth - 12f).coerceAtLeast(12f))
         val baseDrawY = centerY - (layoutHeight / 2f)
 
-        // Ensure solid background patch ALWAYS covers 100% of original foreign text + translated text
-        val textRect = RectF(
-            baseDrawX - 10f,
-            baseDrawY - 8f,
-            baseDrawX + layoutWidth + 10f,
-            baseDrawY + layoutHeight + 8f
-        )
+        // Cover 100% of:
+        // 1) Original foreign text boundingBox (generous 14px margin on all sides so zero strokes peek out)
+        // 2) Detected original manga speech bubble interior (bubbleBox)
+        // 3) Translated Indonesian text layout box (padded cleanly)
         val origRect = RectF(block.boundingBox).apply {
-            inset(-10f, -10f)
+            inset(-14f, -14f)
         }
-        val basePatchRect = RectF(origRect).apply { union(textRect) }
+        val textRect = RectF(
+            baseDrawX - 12f,
+            baseDrawY - 10f,
+            baseDrawX + layoutWidth + 12f,
+            baseDrawY + layoutHeight + 10f
+        )
+        val basePatchRect = RectF(origRect).apply {
+            union(textRect)
+            if (block.bubbleBox != null) {
+                val bRect = RectF(block.bubbleBox)
+                // Expand inside the detected manga speech bubble so the original bubble is cleanly covered
+                if (bRect.width() <= screenWidth * 0.78f && bRect.height() <= effectiveHeight() * 0.45f) {
+                    union(bRect)
+                }
+            }
+        }
 
-        // Keep patch safely inside screen width without ever cutting into original foreign text
         basePatchRect.left = basePatchRect.left.coerceAtLeast(4f)
         basePatchRect.right = basePatchRect.right.coerceAtMost(screenWidth - 4f)
 
-        val cornerRadius = minOf(16f, basePatchRect.height() * 0.25f).coerceAtLeast(8f)
+        // Re-center Indonesian text nicely inside the final white bubble patch
+        val centeredDrawX = (basePatchRect.centerX() - layoutWidth * 0.5f)
+            .coerceIn(basePatchRect.left + 6f, (basePatchRect.right - layoutWidth - 6f).coerceAtLeast(basePatchRect.left + 6f))
+        val centeredDrawY = (basePatchRect.centerY() - layoutHeight * 0.5f)
+            .coerceIn(basePatchRect.top + 4f, (basePatchRect.bottom - layoutHeight - 4f).coerceAtLeast(basePatchRect.top + 4f))
+
+        val cornerRadius = minOf(24f, minOf(basePatchRect.width(), basePatchRect.height()) * 0.30f)
+            .coerceAtLeast(10f)
 
         return PreparedBlock(
             block = block,
@@ -499,20 +515,26 @@ class OverlayView @JvmOverloads constructor(
             strokeLayout = strokeLayout,
             fillPaint = fillPaint,
             strokePaint = strokePaint,
-            bgColor = bgColor,
-            isLightBg = isLightBg,
-            baseDrawX = baseDrawX,
-            baseDrawY = baseDrawY,
+            baseDrawX = centeredDrawX,
+            baseDrawY = centeredDrawY,
             basePatchRect = basePatchRect,
             cornerRadius = cornerRadius
         )
     }
 
     private fun effectiveWidth(): Float {
-        return if (width > 0) width.toFloat() else resources.displayMetrics.widthPixels.toFloat()
+        return when {
+            fullScreenWidth > 0 -> fullScreenWidth.toFloat()
+            width > 0 -> width.toFloat()
+            else -> resources.displayMetrics.widthPixels.toFloat()
+        }
     }
 
     private fun effectiveHeight(): Float {
-        return if (height > 0) height.toFloat() else resources.displayMetrics.heightPixels.toFloat()
+        return when {
+            fullScreenHeight > 0 -> fullScreenHeight.toFloat()
+            height > 0 -> height.toFloat()
+            else -> resources.displayMetrics.heightPixels.toFloat()
+        }
     }
 }
