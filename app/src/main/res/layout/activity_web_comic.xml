@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0D0D16"
+    android:orientation="vertical">
+
+    <!-- Top Compact Comic Browser Address & Search Bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:background="#151523"
+        android:elevation="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp">
+
+        <ImageView
+            android:id="@+id/btnCloseReader"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Tutup"
+            android:padding="8dp"
+            android:src="@drawable/ic_clear"
+            app:tint="#CFD8DC" />
+
+        <EditText
+            android:id="@+id/etUrlBar"
+            android:layout_width="0dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_url_input"
+            android:hint="Cari komik atau tempel link web..."
+            android:imeOptions="actionGo"
+            android:inputType="textUri"
+            android:maxLines="1"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:singleLine="true"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#78829E"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/btnGoUrl"
+            android:layout_width="wrap_content"
+            android:layout_height="34dp"
+            android:background="@drawable/bg_chip_selected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="Buka"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- Page Loading + Chapter Panel Translation Progress Banner -->
+    <ProgressBar
+        android:id="@+id/pbWebLoad"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="3dp"
+        android:max="100"
+        android:progressTint="#7C4DFF"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:id="@+id/llChapterProgress"
+        android:layout_width="match_parent"
+        android:layout_height="30dp"
+        android:background="#1F1938"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:id="@+id/pbPanelSpinner"
+            android:layout_width="14dp"
+            android:layout_height="14dp"
+            android:layout_marginEnd="8dp"
+            android:indeterminateTint="#00E676" />
+
+        <TextView
+            android:id="@+id/tvChapterProgress"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="Menerjemahkan panel 1 / 20..."
+            android:textColor="#E0E0FF"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/tvToggleOrig"
+            android:layout_width="wrap_content"
+            android:layout_height="22dp"
+            android:background="@drawable/bg_chip_unselected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:text="Lihat Asli"
+            android:textColor="#FFD54F"
+            android:textSize="10sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <!-- Main Full-Height Comic WebView -->
+    <WebView
+        android:id="@+id/webViewComic"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <!-- Bottom Reader & Full-Chapter Auto-Translate Control Bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="52dp"
+        android:background="#151523"
+        android:elevation="10dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp">
+
+        <!-- Nav Back -->
+        <TextView
+            android:id="@+id/btnWebBack"
+            android:layout_width="38dp"
+            android:layout_height="36dp"
+            android:background="@drawable/bg_chip_unselected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="◀"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
+
+        <!-- Nav Forward -->
+        <TextView
+            android:id="@+id/btnWebForward"
+            android:layout_width="38dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="5dp"
+            android:background="@drawable/bg_chip_unselected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="▶"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
+
+        <!-- Language Cycle Chip (JA / KO / EN / ZH) -->
+        <TextView
+            android:id="@+id/btnReaderLang"
+            android:layout_width="46dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/bg_chip_selected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:text="JA"
+            android:textColor="#FFD54F"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
+        <!-- Solid White BG Toggle -->
+        <TextView
+            android:id="@+id/btnReaderBg"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/bg_style_toggle_on"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="9dp"
+            android:paddingEnd="9dp"
+            android:text="BG PUTIH"
+            android:textColor="#FFFFFF"
+            android:textSize="10sp"
+            android:textStyle="bold" />
+
+        <!-- Auto Chapter Switch -->
+        <TextView
+            android:id="@+id/btnAutoChapter"
+            android:layout_width="0dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:layout_weight="1"
+            android:background="@drawable/bg_auto_toggle_on"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:text="AUTO CHAPTER: ON"
+            android:textColor="#FFFFFF"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <!-- Manual Scan / Rescan All Panels Now -->
+        <ImageView
+            android:id="@+id/btnScanChapterNow"
+            android:layout_width="38dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:background="@drawable/bg_floating_bubble"
+            android:clickable="true"
+            android:contentDescription="Terjemahkan semua panel"
+            android:focusable="true"
+            android:padding="7dp"
+            android:src="@drawable/ic_translate"
+            app:tint="#FFFFFF" />
+    </LinearLayout>
+
+</LinearLayout>

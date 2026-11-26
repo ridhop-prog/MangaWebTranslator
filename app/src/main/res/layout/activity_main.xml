@@ -154,26 +154,56 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- Primary Action Buttons Right Above The Fold -->
+        <!-- Primary Mode Selection Buttons Right Above The Fold -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginBottom="16dp"
             android:orientation="vertical">
 
+            <!-- Mode 1 (Featured): Built-in Web Comic Reader with Full-Chapter Auto Translation -->
+            <Button
+                android:id="@+id/btnOpenWebReader"
+                style="@style/Widget.MaterialComponents.Button"
+                android:layout_width="match_parent"
+                android:layout_height="58dp"
+                android:backgroundTint="#00BFA5"
+                android:text="Buka Browser Komik (Auto 1 Chapter)"
+                android:textAllCaps="false"
+                android:textColor="#071A18"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                app:cornerRadius="16dp"
+                app:elevation="6dp"
+                app:icon="@drawable/ic_translate"
+                app:iconGravity="textStart"
+                app:iconPadding="10dp"
+                app:iconTint="#071A18" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="10dp"
+                android:gravity="center"
+                android:text="Otomatis terjemahkan semua panel dari atas ke bawah — tinggal scroll mulus!"
+                android:textColor="#80CBC4"
+                android:textSize="11sp" />
+
+            <!-- Mode 2: Floating Overlay Translator for External Apps -->
             <Button
                 android:id="@+id/btnStartFloating"
                 style="@style/Widget.MaterialComponents.Button"
                 android:layout_width="match_parent"
-                android:layout_height="56dp"
+                android:layout_height="52dp"
                 android:backgroundTint="#7C4DFF"
-                android:text="@string/btn_start_service"
+                android:text="Tombol Melayang (Untuk Aplikasi Lain)"
                 android:textAllCaps="false"
                 android:textColor="#FFFFFF"
-                android:textSize="15sp"
+                android:textSize="14sp"
                 android:textStyle="bold"
                 app:cornerRadius="16dp"
-                app:elevation="6dp"
+                app:elevation="4dp"
                 app:icon="@drawable/ic_translate"
                 app:iconGravity="textStart"
                 app:iconPadding="10dp" />

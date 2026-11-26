@@ -206,6 +206,11 @@ class MainActivity : AppCompatActivity() {
             openOverlaySettings()
         }
 
+        binding.btnOpenWebReader.setOnClickListener {
+            preDownloadLanguageModel(selectedLangIndex)
+            startActivity(Intent(this, WebComicActivity::class.java))
+        }
+
         binding.btnStartFloating.setOnClickListener {
             if (!hasOverlayPermission()) {
                 openOverlaySettings()
@@ -333,7 +338,7 @@ class MainActivity : AppCompatActivity() {
             binding.viewStatusDot.setBackgroundResource(R.drawable.bg_auto_dot_off)
             binding.tvServiceStatus.text = "Siap"
             binding.tvServiceStatus.setTextColor(Color.parseColor("#FFB74D"))
-            binding.btnStartFloating.text = getString(R.string.btn_start_service)
+            binding.btnStartFloating.text = "Tombol Melayang (Untuk Aplikasi Lain)"
             binding.btnStopFloating.visibility = View.GONE
         }
     }
