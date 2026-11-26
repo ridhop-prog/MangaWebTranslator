@@ -33,23 +33,24 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 /**
- * Built-in Web Comic Reader with Automatic Full-Chapter Panel Translation:
+ * Built-in Web Comic Reader with Automatic Full-Chapter Panel Translation & Cross-Panel Batching:
  * 1. Scans all comic panel images in the chapter DOM (unlocking lazy-loaded images automatically).
- * 2. Prioritizes the panel currently visible in the user's viewport first, then pre-translates
- *    every remaining panel from top to bottom in the background.
- * 3. Replaces each panel image in-place with a solid-white translated version served via
- *    virtual origin https://mangatranslator.local/translated/<file> -> 100% smooth native scroll!
+ * 2. Downloads & OCRs panels in parallel, prioritizing the user's current viewport first.
+ * 3. Groups multiple OCR'd panels together into Cross-Panel Batches (preserving story context
+ *    and avoiding API rate-limits for both AI Comic mode and No-Key Multi-Engine mode).
+ * 4. Replaces each panel image in-place via https://mangatranslator.local/translated/<file>.
  */
 class WebComicActivity : AppCompatActivity() {
 
     companion object {
-        private const val PREF_NAME = "ScreenMangaTranslatorPrefs"
-        private const val PREF_KEY_LANG = "pref_key_lang_index"
-        private const val PREF_KEY_BG_STYLE = "pref_key_bg_style"
-        private const val PREF_KEY_TEXT_SCALE = "pref_key_text_scale"
-        private const val PREF_KEY_LAST_URL = "pref_key_last_comic_url"
         private const val VIRTUAL_HOST = "mangatranslator.local"
         private const val DEFAULT_HOME_URL = "https://www.google.com/search?q=baca+manga+raw+chapter"
+
+        private const val MAX_OCR_WORKERS = 3
+        private const val BATCH_COALESCE_MS = 220L
+        private const val MAX_VISION_PANELS_PER_BATCH = 3
+        private const val MAX_TEXT_PANELS_PER_BATCH = 5
+        private const val MAX_BUBBLES_PER_BATCH = 32
 
         private val AD_BLOCK_KEYWORDS = listOf(
             "doubleclick.net",
@@ -70,7 +71,7 @@ class WebComicActivity : AppCompatActivity() {
         val domId: String,
         val imageUrl: String,
         var topY: Float,
-        @Volatile var status: Int = STATUS_PENDING, // 0=pending, 1=running, 2=done, 3=empty/failed
+        @Volatile var status: Int = STATUS_PENDING, // 0=pending, 1=running, 2=done, 3=skipped
         @Volatile var translatedFile: String? = null
     ) {
         companion object {
@@ -81,18 +82,32 @@ class WebComicActivity : AppCompatActivity() {
         }
     }
 
+    private data class QueuedOcrPanel(
+        val task: PanelTask,
+        val generation: Int,
+        val ready: PanelImageTranslator.PrepareResult.Ready,
+        val bgStyle: Int,
+        val textScale: Float
+    )
+
     private lateinit var binding: ActivityWebComicBinding
     private lateinit var prefs: SharedPreferences
     private lateinit var comicTranslator: ComicTranslator
     private lateinit var panelTranslator: PanelImageTranslator
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val panelWorkerPool = Executors.newFixedThreadPool(2)
+    private val panelWorkerPool = Executors.newFixedThreadPool(MAX_OCR_WORKERS)
+    private val batchTranslatorExecutor = Executors.newSingleThreadExecutor()
     private val chapterGeneration = AtomicInteger(0)
 
     private val panelMap = ConcurrentHashMap<String, PanelTask>()
-    private val queueLock = Any()
-    private var activeWorkers = 0
+    private val queueLock = Object()
+    private var activeOcrWorkers = 0
+
+    private val batchLock = Object()
+    private val readyOcrQueue = ArrayList<QueuedOcrPanel>()
+    @Volatile
+    private var isBatchLoopRunning = false
 
     @Volatile
     private var currentScrollY: Float = 0f
@@ -106,6 +121,7 @@ class WebComicActivity : AppCompatActivity() {
     private var currentLangIndex = 0
     private var bgStyle = OverlayView.STYLE_SEAMLESS_WHITE
     private var textScale = 1.0f
+    private var comicStyle = TranslatorPrefs.STYLE_NATURAL
     private var currentPageUrl = ""
     private var webUserAgent = ""
 
@@ -114,10 +130,8 @@ class WebComicActivity : AppCompatActivity() {
         binding = ActivityWebComicBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        prefs = getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        currentLangIndex = prefs.getInt(PREF_KEY_LANG, 0).coerceIn(0, 3)
-        bgStyle = prefs.getInt(PREF_KEY_BG_STYLE, OverlayView.STYLE_SEAMLESS_WHITE)
-        textScale = prefs.getFloat(PREF_KEY_TEXT_SCALE, 1.0f)
+        prefs = TranslatorPrefs.prefs(this)
+        loadPreferences()
 
         comicTranslator = ComicTranslator(this).apply {
             preWarm(currentLangIndex)
@@ -128,12 +142,29 @@ class WebComicActivity : AppCompatActivity() {
         setupWebView()
         setupBackNavigation()
 
-        val startUrl = prefs.getString(PREF_KEY_LAST_URL, DEFAULT_HOME_URL) ?: DEFAULT_HOME_URL
+        val startUrl = prefs.getString(TranslatorPrefs.KEY_LAST_URL, DEFAULT_HOME_URL) ?: DEFAULT_HOME_URL
         loadInputOrUrl(startUrl)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        loadPreferences()
+        updateLangUI()
+        updateStyleUI()
+        updateBgUI()
+        updateProgressBanner()
+    }
+
+    private fun loadPreferences() {
+        currentLangIndex = TranslatorPrefs.getLangIndex(this)
+        bgStyle = TranslatorPrefs.getBgStyle(this)
+        textScale = TranslatorPrefs.getTextScale(this)
+        comicStyle = TranslatorPrefs.getComicStyle(this)
     }
 
     private fun setupToolbarAndControls() {
         updateLangUI()
+        updateStyleUI()
         updateBgUI()
         updateAutoChapterUI()
 
@@ -179,7 +210,7 @@ class WebComicActivity : AppCompatActivity() {
 
         binding.btnReaderLang.setOnClickListener {
             currentLangIndex = (currentLangIndex + 1) % 4
-            prefs.edit().putInt(PREF_KEY_LANG, currentLangIndex).apply()
+            TranslatorPrefs.setLangIndex(this, currentLangIndex)
             updateLangUI()
             comicTranslator.preWarm(currentLangIndex)
             val langName = when (currentLangIndex) {
@@ -192,13 +223,29 @@ class WebComicActivity : AppCompatActivity() {
             retranslateCurrentChapter()
         }
 
+        binding.btnReaderStyle.setOnClickListener {
+            comicStyle = if (comicStyle == TranslatorPrefs.STYLE_NATURAL) {
+                TranslatorPrefs.STYLE_CASUAL
+            } else {
+                TranslatorPrefs.STYLE_NATURAL
+            }
+            TranslatorPrefs.setComicStyle(this, comicStyle)
+            updateStyleUI()
+            Toast.makeText(
+                this,
+                "Gaya bahasa: ${TranslatorPrefs.getStyleFullLabel(comicStyle)}",
+                Toast.LENGTH_SHORT
+            ).show()
+            retranslateCurrentChapter()
+        }
+
         binding.btnReaderBg.setOnClickListener {
             bgStyle = if (bgStyle == OverlayView.STYLE_SEAMLESS_WHITE) {
                 OverlayView.STYLE_TRANSPARENT
             } else {
                 OverlayView.STYLE_SEAMLESS_WHITE
             }
-            prefs.edit().putInt(PREF_KEY_BG_STYLE, bgStyle).apply()
+            TranslatorPrefs.setBgStyle(this, bgStyle)
             updateBgUI()
             retranslateCurrentChapter()
         }
@@ -214,7 +261,7 @@ class WebComicActivity : AppCompatActivity() {
                 ).show()
                 triggerDomPanelScan()
             } else {
-                chapterGeneration.incrementAndGet()
+                resetPendingChapterWork()
                 binding.llChapterProgress.visibility = View.GONE
                 Toast.makeText(this, "Auto Chapter NONAKTIF", Toast.LENGTH_SHORT).show()
             }
@@ -223,7 +270,11 @@ class WebComicActivity : AppCompatActivity() {
         binding.btnScanChapterNow.setOnClickListener {
             showingOriginal = false
             binding.tvToggleOrig.text = "Lihat Asli"
-            Toast.makeText(this, "Memindai & menerjemahkan seluruh panel...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "Memindai ulang (${comicTranslator.getConfiguredEngineLabel()})...",
+                Toast.LENGTH_SHORT
+            ).show()
             triggerDomPanelScan(forceRescan = true)
         }
 
@@ -247,30 +298,53 @@ class WebComicActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateStyleUI() {
+        if (comicStyle == TranslatorPrefs.STYLE_CASUAL) {
+            binding.btnReaderStyle.text = "GAUL"
+            binding.btnReaderStyle.setTextColor(0xFFFFD54F.toInt())
+        } else {
+            binding.btnReaderStyle.text = "NAT"
+            binding.btnReaderStyle.setTextColor(0xFF80CBC4.toInt())
+        }
+    }
+
     private fun updateBgUI() {
         if (bgStyle == OverlayView.STYLE_SEAMLESS_WHITE) {
             binding.btnReaderBg.setBackgroundResource(R.drawable.bg_style_toggle_on)
-            binding.btnReaderBg.text = "BG PUTIH"
+            binding.btnReaderBg.text = "PUTIH"
         } else {
             binding.btnReaderBg.setBackgroundResource(R.drawable.bg_auto_toggle_off)
-            binding.btnReaderBg.text = "TRANSPARAN"
+            binding.btnReaderBg.text = "TRANS"
         }
     }
 
     private fun updateAutoChapterUI() {
         if (isAutoChapterEnabled) {
             binding.btnAutoChapter.setBackgroundResource(R.drawable.bg_auto_toggle_on)
-            binding.btnAutoChapter.text = "AUTO CHAPTER: ON"
+            binding.btnAutoChapter.text = "AUTO: ON"
         } else {
             binding.btnAutoChapter.setBackgroundResource(R.drawable.bg_auto_toggle_off)
-            binding.btnAutoChapter.text = "AUTO CHAPTER: OFF"
+            binding.btnAutoChapter.text = "AUTO: OFF"
+        }
+    }
+
+    private fun resetPendingChapterWork() {
+        chapterGeneration.incrementAndGet()
+        synchronized(batchLock) {
+            for (queued in readyOcrQueue) {
+                if (!queued.ready.bitmap.isRecycled) {
+                    queued.ready.bitmap.recycle()
+                }
+            }
+            readyOcrQueue.clear()
+            batchLock.notifyAll()
         }
     }
 
     private fun retranslateCurrentChapter() {
         showingOriginal = false
         binding.tvToggleOrig.text = "Lihat Asli"
-        chapterGeneration.incrementAndGet()
+        resetPendingChapterWork()
         panelMap.clear()
         binding.webViewComic.evaluateJavascript(
             "if(window.__mtResetPanels) window.__mtResetPanels();",
@@ -296,7 +370,6 @@ class WebComicActivity : AppCompatActivity() {
             builtInZoomControls = true
             displayZoomControls = false
             setSupportZoom(true)
-            // Block popup spam windows common on manga raw sites
             setSupportMultipleWindows(true)
             javaScriptCanOpenWindowsAutomatically = false
             webUserAgent = userAgentString
@@ -313,7 +386,7 @@ class WebComicActivity : AppCompatActivity() {
                     binding.pbWebLoad.visibility = View.GONE
                 }
             }
-            // Drop popup ad windows by returning false in onCreateWindow
+
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,
@@ -329,11 +402,10 @@ class WebComicActivity : AppCompatActivity() {
                     currentPageUrl = url
                     binding.etUrlBar.setText(url)
                     if (url.startsWith("http")) {
-                        prefs.edit().putString(PREF_KEY_LAST_URL, url).apply()
+                        prefs.edit().putString(TranslatorPrefs.KEY_LAST_URL, url).apply()
                     }
                 }
-                // Reset chapter queue for new page
-                chapterGeneration.incrementAndGet()
+                resetPendingChapterWork()
                 panelMap.clear()
                 showingOriginal = false
                 binding.tvToggleOrig.text = "Lihat Asli"
@@ -359,7 +431,6 @@ class WebComicActivity : AppCompatActivity() {
                 val uri = request?.url ?: return null
                 val host = uri.host?.lowercase().orEmpty()
 
-                // 1. Serve cached translated panel JPEGs in <1ms with zero memory overhead!
                 if (host == VIRTUAL_HOST && uri.path?.startsWith("/translated/") == true) {
                     val fileName = uri.lastPathSegment.orEmpty()
                     val file = panelTranslator.getCachedFile(fileName)
@@ -379,7 +450,6 @@ class WebComicActivity : AppCompatActivity() {
                     }
                 }
 
-                // 2. Block common ad-tracker scripts so comic chapters load cleanly & quickly
                 val urlStr = uri.toString().lowercase()
                 if (AD_BLOCK_KEYWORDS.any { urlStr.contains(it) }) {
                     return WebResourceResponse(
@@ -427,10 +497,6 @@ class WebComicActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Injects DOM scanner + lazy-load unlocker + in-place <picture>/srcset image swapper +
-     * viewport scroll tracker into the comic webpage.
-     */
     private fun injectPanelScannerJs() {
         val js = """
             (function() {
@@ -465,7 +531,6 @@ class WebComicActivity : AppCompatActivity() {
                         if (force) {
                             delete img.dataset.mtQueued;
                         }
-                        // Unlock lazy loading so all panels in chapter become ready
                         if (img.loading === 'lazy') img.loading = 'eager';
                         const url = resolveBestUrl(img);
                         if (!url || url.length < 8 || SKIP_PATTERNS.test(url)) continue;
@@ -475,13 +540,11 @@ class WebComicActivity : AppCompatActivity() {
                         const w = Math.max(rect.width || 0, img.naturalWidth || 0, parseInt(img.getAttribute('width') || '0'));
                         const h = Math.max(rect.height || 0, img.naturalHeight || 0, parseInt(img.getAttribute('height') || '0'));
 
-                        // Skip known small UI icons while keeping not-yet-loaded lazy comic panels
                         if (img.complete && img.naturalWidth > 0 && (img.naturalWidth < 180 || img.naturalHeight < 140)) {
                             continue;
                         }
                         if (w > 0 && w < 150 && h > 0 && h < 120) continue;
 
-                        // Ensure lazy-loaded src is triggered on the element too
                         if ((!img.src || img.src.startsWith('data:')) && url.startsWith('http')) {
                             img.src = url;
                         }
@@ -621,16 +684,15 @@ class WebComicActivity : AppCompatActivity() {
     }
 
     /**
-     * Smart Priority Queue Worker:
-     * Always picks the pending panel closest to (or right below) the user's current scroll
-     * viewport first, then continues pre-translating all remaining panels down to the end of the chapter!
+     * Stage 1: Smart Priority Queue Download + OCR Workers.
+     * Downloads & OCRs viewport panels first, then hands Ready panels to the Cross-Panel Batcher.
      */
     private fun pumpWorkers(gen: Int) {
         synchronized(queueLock) {
-            while (activeWorkers < 2) {
+            while (activeOcrWorkers < MAX_OCR_WORKERS) {
                 val nextTask = pickNextPriorityPanel() ?: break
                 nextTask.status = PanelTask.STATUS_RUNNING
-                activeWorkers++
+                activeOcrWorkers++
 
                 val pageUrlSnapshot = currentPageUrl
                 val cookieSnapshot = try {
@@ -646,7 +708,7 @@ class WebComicActivity : AppCompatActivity() {
 
                 panelWorkerPool.execute {
                     try {
-                        val fileName = panelTranslator.translatePanelImageSync(
+                        val prep = panelTranslator.preparePanelForTranslation(
                             imageUrl = nextTask.imageUrl,
                             pageUrl = pageUrlSnapshot,
                             cookie = cookieSnapshot,
@@ -657,28 +719,33 @@ class WebComicActivity : AppCompatActivity() {
                             isCancelled = { gen != chapterGeneration.get() }
                         )
 
-                        if (gen == chapterGeneration.get()) {
-                            if (!fileName.isNullOrEmpty()) {
-                                nextTask.translatedFile = fileName
-                                nextTask.status = PanelTask.STATUS_DONE
-                                val servedUrl = "https://$VIRTUAL_HOST/translated/$fileName"
-                                mainHandler.post {
-                                    if (!showingOriginal && gen == chapterGeneration.get()) {
-                                        binding.webViewComic.evaluateJavascript(
-                                            "if(window.__mtApplyTranslated) window.__mtApplyTranslated('${nextTask.domId}', '$servedUrl');",
-                                            null
-                                        )
-                                    }
-                                    updateProgressBanner()
+                        if (gen != chapterGeneration.get()) {
+                            if (prep is PanelImageTranslator.PrepareResult.Ready && !prep.bitmap.isRecycled) {
+                                prep.bitmap.recycle()
+                            }
+                        } else {
+                            when (prep) {
+                                is PanelImageTranslator.PrepareResult.Cached -> {
+                                    applyCompletedPanel(nextTask, prep.fileName, gen)
                                 }
-                            } else {
-                                nextTask.status = PanelTask.STATUS_SKIPPED
-                                mainHandler.post { updateProgressBanner() }
+                                is PanelImageTranslator.PrepareResult.Empty,
+                                is PanelImageTranslator.PrepareResult.Failed -> {
+                                    nextTask.status = PanelTask.STATUS_SKIPPED
+                                    mainHandler.post { updateProgressBanner() }
+                                }
+                                is PanelImageTranslator.PrepareResult.Ready -> {
+                                    enqueueForCrossPanelBatch(
+                                        QueuedOcrPanel(nextTask, gen, prep, bgSnapshot, scaleSnapshot)
+                                    )
+                                }
                             }
                         }
                     } finally {
                         synchronized(queueLock) {
-                            activeWorkers = (activeWorkers - 1).coerceAtLeast(0)
+                            activeOcrWorkers = (activeOcrWorkers - 1).coerceAtLeast(0)
+                        }
+                        synchronized(batchLock) {
+                            batchLock.notifyAll()
                         }
                         if (gen == chapterGeneration.get()) {
                             pumpWorkers(gen)
@@ -686,6 +753,159 @@ class WebComicActivity : AppCompatActivity() {
                     }
                 }
             }
+        }
+    }
+
+    private fun enqueueForCrossPanelBatch(item: QueuedOcrPanel) {
+        synchronized(batchLock) {
+            if (item.generation != chapterGeneration.get()) {
+                if (!item.ready.bitmap.isRecycled) item.ready.bitmap.recycle()
+                return
+            }
+            readyOcrQueue.add(item)
+            if (!isBatchLoopRunning) {
+                isBatchLoopRunning = true
+                batchTranslatorExecutor.execute { runCrossPanelBatchLoop() }
+            }
+            batchLock.notifyAll()
+        }
+    }
+
+    /**
+     * Stage 2: Cross-Panel Batch Dispatcher.
+     * Coalesces multiple OCR'd panels into 1 combined translation call (AI or Multi-Engine)
+     * so character pronouns & story context remain consistent while cutting API calls by 3x-5x.
+     */
+    private fun runCrossPanelBatchLoop() {
+        while (true) {
+            val batchToProcess: List<QueuedOcrPanel>
+            synchronized(batchLock) {
+                if (readyOcrQueue.isEmpty()) {
+                    isBatchLoopRunning = false
+                    return
+                }
+
+                val maxPanels = if (comicTranslator.isGeminiVisionReady()) {
+                    MAX_VISION_PANELS_PER_BATCH
+                } else {
+                    MAX_TEXT_PANELS_PER_BATCH
+                }
+
+                // Coalesce briefly so parallel OCR workers can fill the batch together
+                val deadline = System.currentTimeMillis() + BATCH_COALESCE_MS
+                while (readyOcrQueue.size < maxPanels && hasMoreOcrWorkInProgress()) {
+                    val waitMs = deadline - System.currentTimeMillis()
+                    if (waitMs <= 0L) break
+                    try {
+                        batchLock.wait(waitMs)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+
+                val curGen = chapterGeneration.get()
+                val valid = ArrayList<QueuedOcrPanel>()
+                val iter = readyOcrQueue.iterator()
+                while (iter.hasNext()) {
+                    val q = iter.next()
+                    if (q.generation != curGen) {
+                        if (!q.ready.bitmap.isRecycled) q.ready.bitmap.recycle()
+                        iter.remove()
+                    } else {
+                        valid.add(q)
+                    }
+                }
+
+                if (valid.isEmpty()) {
+                    isBatchLoopRunning = false
+                    return
+                }
+
+                // Sort by vertical reading position so AI sees Panel 1 -> Panel 2 -> Panel 3 in order
+                val sorted = valid.sortedBy { it.task.topY }
+                val picked = ArrayList<QueuedOcrPanel>(maxPanels)
+                var bubbleSum = 0
+                for (q in sorted) {
+                    val bCount = q.ready.requests.size
+                    if (picked.isNotEmpty() &&
+                        (picked.size >= maxPanels || bubbleSum + bCount > MAX_BUBBLES_PER_BATCH)
+                    ) {
+                        break
+                    }
+                    picked.add(q)
+                    bubbleSum += bCount
+                }
+
+                readyOcrQueue.removeAll(picked.toSet())
+                batchToProcess = picked
+            }
+
+            processCrossPanelBatch(batchToProcess)
+        }
+    }
+
+    private fun hasMoreOcrWorkInProgress(): Boolean {
+        val pendingExists = panelMap.values.any { it.status == PanelTask.STATUS_PENDING }
+        if (pendingExists) return true
+        synchronized(queueLock) {
+            return activeOcrWorkers > 0
+        }
+    }
+
+    private fun processCrossPanelBatch(batch: List<QueuedOcrPanel>) {
+        if (batch.isEmpty()) return
+        val gen = batch[0].generation
+
+        if (gen != chapterGeneration.get()) {
+            for (q in batch) {
+                if (!q.ready.bitmap.isRecycled) q.ready.bitmap.recycle()
+            }
+            return
+        }
+
+        val inputs = batch.map { q ->
+            ComicTranslator.PanelBatchInput(
+                bubbles = q.ready.requests,
+                panelJpegBytes = q.ready.visionJpegBytes
+            )
+        }
+
+        val translatedMatrix = comicTranslator.translateMultiPanelBatchSync(inputs)
+
+        for (i in batch.indices) {
+            val item = batch[i]
+            val panelTranslations = translatedMatrix.getOrNull(i).orEmpty()
+            val fileName = panelTranslator.bakeAndSavePanel(
+                ready = item.ready,
+                translatedTexts = panelTranslations,
+                bgStyle = item.bgStyle,
+                textScale = item.textScale,
+                isCancelled = { gen != chapterGeneration.get() }
+            )
+
+            if (gen == chapterGeneration.get()) {
+                if (!fileName.isNullOrEmpty()) {
+                    applyCompletedPanel(item.task, fileName, gen)
+                } else {
+                    item.task.status = PanelTask.STATUS_SKIPPED
+                    mainHandler.post { updateProgressBanner() }
+                }
+            }
+        }
+    }
+
+    private fun applyCompletedPanel(task: PanelTask, fileName: String, gen: Int) {
+        task.translatedFile = fileName
+        task.status = PanelTask.STATUS_DONE
+        val servedUrl = "https://$VIRTUAL_HOST/translated/$fileName"
+        mainHandler.post {
+            if (!showingOriginal && gen == chapterGeneration.get()) {
+                binding.webViewComic.evaluateJavascript(
+                    "if(window.__mtApplyTranslated) window.__mtApplyTranslated('${task.domId}', '$servedUrl');",
+                    null
+                )
+            }
+            updateProgressBanner()
         }
     }
 
@@ -699,13 +919,13 @@ class WebComicActivity : AppCompatActivity() {
         for (task in panelMap.values) {
             if (task.status != PanelTask.STATUS_PENDING) continue
 
-            // Score priority:
-            // 1. Panels currently inside or right below [viewTop - 400 .. viewBottom + 2400] get top priority in top-down order!
-            // 2. Panels further down the chapter come next in top-down order.
-            // 3. Panels already scrolled way above viewTop come last.
             val score = when {
-                task.topY >= viewTop - 400f -> (task.topY - viewTop).coerceAtLeast(0f)
-                else -> 1_000_000f + abs(viewTop - task.topY)
+                task.topY in (viewTop - 400f)..(viewBottom + 900f) ->
+                    (task.topY - (viewTop - 400f)).coerceAtLeast(0f)
+                task.topY > viewBottom + 900f ->
+                    10_000f + (task.topY - viewBottom)
+                else ->
+                    1_000_000f + abs(viewTop - task.topY)
             }
             if (score < bestScore) {
                 bestScore = score
@@ -727,16 +947,18 @@ class WebComicActivity : AppCompatActivity() {
             it.status == PanelTask.STATUS_DONE || it.status == PanelTask.STATUS_SKIPPED
         }
         val translatedCount = all.count { it.status == PanelTask.STATUS_DONE }
+        val engineLabel = if (finished > 0) comicTranslator.lastUsedEngineLabel else comicTranslator.getConfiguredEngineLabel()
+        val styleLabel = TranslatorPrefs.getStyleShortLabel(comicStyle)
 
         binding.llChapterProgress.visibility = View.VISIBLE
         if (finished < total) {
             binding.pbPanelSpinner.visibility = View.VISIBLE
             binding.tvChapterProgress.text =
-                "Menerjemahkan seluruh chapter: $finished / $total panel..."
+                "[$engineLabel • $styleLabel] Menerjemahkan $finished / $total panel..."
         } else {
             binding.pbPanelSpinner.visibility = View.GONE
             binding.tvChapterProgress.text =
-                "Selesai! $translatedCount panel diterjemahkan — tinggal scroll mulus ✓"
+                "Selesai [$engineLabel • $styleLabel]! $translatedCount panel diterjemahkan ✓"
         }
     }
 
@@ -746,9 +968,10 @@ class WebComicActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        chapterGeneration.incrementAndGet()
+        resetPendingChapterWork()
         mainHandler.removeCallbacksAndMessages(null)
         panelWorkerPool.shutdownNow()
+        batchTranslatorExecutor.shutdownNow()
         comicTranslator.shutdown()
         binding.webViewComic.stopLoading()
         binding.webViewComic.destroy()

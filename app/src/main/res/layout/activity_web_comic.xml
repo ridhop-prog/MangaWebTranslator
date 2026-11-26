@@ -139,7 +139,7 @@
         <!-- Nav Back -->
         <TextView
             android:id="@+id/btnWebBack"
-            android:layout_width="38dp"
+            android:layout_width="34dp"
             android:layout_height="36dp"
             android:background="@drawable/bg_chip_unselected"
             android:clickable="true"
@@ -152,9 +152,9 @@
         <!-- Nav Forward -->
         <TextView
             android:id="@+id/btnWebForward"
-            android:layout_width="38dp"
+            android:layout_width="34dp"
             android:layout_height="36dp"
-            android:layout_marginStart="5dp"
+            android:layout_marginStart="4dp"
             android:background="@drawable/bg_chip_unselected"
             android:clickable="true"
             android:focusable="true"
@@ -166,16 +166,33 @@
         <!-- Language Cycle Chip (JA / KO / EN / ZH) -->
         <TextView
             android:id="@+id/btnReaderLang"
-            android:layout_width="46dp"
+            android:layout_width="38dp"
             android:layout_height="36dp"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="5dp"
             android:background="@drawable/bg_chip_selected"
             android:clickable="true"
             android:focusable="true"
             android:gravity="center"
             android:text="JA"
             android:textColor="#FFD54F"
-            android:textSize="12sp"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <!-- Comic Dialogue Style Toggle (NAT / GAUL) -->
+        <TextView
+            android:id="@+id/btnReaderStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="5dp"
+            android:background="@drawable/bg_chip_selected"
+            android:clickable="true"
+            android:focusable="true"
+            android:gravity="center"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:text="NAT"
+            android:textColor="#80CBC4"
+            android:textSize="10sp"
             android:textStyle="bold" />
 
         <!-- Solid White BG Toggle -->
@@ -183,14 +200,14 @@
             android:id="@+id/btnReaderBg"
             android:layout_width="wrap_content"
             android:layout_height="36dp"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="5dp"
             android:background="@drawable/bg_style_toggle_on"
             android:clickable="true"
             android:focusable="true"
             android:gravity="center"
-            android:paddingStart="9dp"
-            android:paddingEnd="9dp"
-            android:text="BG PUTIH"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:text="PUTIH"
             android:textColor="#FFFFFF"
             android:textSize="10sp"
             android:textStyle="bold" />
@@ -200,25 +217,25 @@
             android:id="@+id/btnAutoChapter"
             android:layout_width="0dp"
             android:layout_height="36dp"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="5dp"
             android:layout_weight="1"
             android:background="@drawable/bg_auto_toggle_on"
             android:clickable="true"
             android:focusable="true"
             android:gravity="center"
-            android:paddingStart="8dp"
-            android:paddingEnd="8dp"
-            android:text="AUTO CHAPTER: ON"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:text="AUTO: ON"
             android:textColor="#FFFFFF"
-            android:textSize="11sp"
+            android:textSize="10sp"
             android:textStyle="bold" />
 
         <!-- Manual Scan / Rescan All Panels Now -->
         <ImageView
             android:id="@+id/btnScanChapterNow"
-            android:layout_width="38dp"
+            android:layout_width="36dp"
             android:layout_height="36dp"
-            android:layout_marginStart="6dp"
+            android:layout_marginStart="5dp"
             android:background="@drawable/bg_floating_bubble"
             android:clickable="true"
             android:contentDescription="Terjemahkan semua panel"

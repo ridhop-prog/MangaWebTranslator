@@ -1104,6 +1104,14 @@ class FloatingService : Service() {
                     rawItems.add(MergedOcrBlock(box, bubbleBounds, cleanText))
                 }
 
+                val bmpWidth = fullBitmap.width.coerceAtLeast(1).toFloat()
+                val bmpHeight = fullBitmap.height.coerceAtLeast(1).toFloat()
+                val visionJpegBytes = if (rawItems.isNotEmpty() && comicTranslator.isGeminiVisionReady()) {
+                    encodeScreenVisionJpeg(fullBitmap)
+                } else {
+                    null
+                }
+
                 fullBitmap.recycle()
 
                 if (rawItems.isEmpty()) {
@@ -1125,11 +1133,17 @@ class FloatingService : Service() {
 
                 val translationRequests = panelBubbles.map { item ->
                     val srcLang = comicTranslator.detectBubbleSourceLang(item.cleanText, currentLangIndex)
-                    ComicTranslator.TranslationRequest(item.cleanText, srcLang)
+                    val normBox = intArrayOf(
+                        (item.bubbleBox.top * 1000f / bmpHeight).roundToInt().coerceIn(0, 1000),
+                        (item.bubbleBox.left * 1000f / bmpWidth).roundToInt().coerceIn(0, 1000),
+                        (item.bubbleBox.bottom * 1000f / bmpHeight).roundToInt().coerceIn(0, 1000),
+                        (item.bubbleBox.right * 1000f / bmpWidth).roundToInt().coerceIn(0, 1000)
+                    )
+                    ComicTranslator.TranslationRequest(item.cleanText, srcLang, normBox)
                 }
 
-                // Single-shot whole-panel batch translation (ALL bubbles translated together!)
-                comicTranslator.translatePanelBatch(translationRequests) { translatedList ->
+                // Single-shot whole-panel batch translation (AI Comic + Vision or Multi-Engine Anti-Limit)
+                comicTranslator.translatePanelBatch(translationRequests, visionJpegBytes) { translatedList ->
                     finishTranslation(ivIcon, pbLoading)
 
                     val scrolledTooFar = abs(scrollTracker.currentShiftY - scanShiftY) > captureHeight * 0.65f
@@ -1437,5 +1451,29 @@ class FloatingService : Service() {
         mediaProjection = null
 
         super.onDestroy()
+    }
+
+    private fun encodeScreenVisionJpeg(bitmap: Bitmap): ByteArray? {
+        return try {
+            val maxW = 720f
+            val maxH = 1280f
+            val scale = minOf(1f, maxW / bitmap.width.toFloat(), maxH / bitmap.height.toFloat())
+            val scaled = if (scale < 0.99f) {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    (bitmap.width * scale).roundToInt().coerceAtLeast(1),
+                    (bitmap.height * scale).roundToInt().coerceAtLeast(1),
+                    true
+                )
+            } else {
+                bitmap
+            }
+            val bos = java.io.ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 74, bos)
+            if (scaled !== bitmap) scaled.recycle()
+            bos.toByteArray()
+        } catch (_: Exception) {
+            null
+        }
     }
 }

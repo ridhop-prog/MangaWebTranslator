@@ -28,16 +28,14 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
- * Downloads a comic panel image, detects all speech bubbles across the entire panel
- * (including tall vertical Webtoon strips via overlapping vertical chunking), translates
- * all bubbles together, and bakes solid white bubbles + Indonesian text directly into
- * a cached panel image for 100% native lag-free scrolling.
+ * Downloads comic panel images, runs chunked ML Kit OCR across the entire strip,
+ * prepares optional downscaled JPEGs for Gemini Vision validation, and bakes solid white
+ * speech bubbles + Indonesian dialogue onto cached panel images for lag-free scrolling.
  */
 class PanelImageTranslator(
     private val context: Context,
@@ -51,13 +49,28 @@ class PanelImageTranslator(
         private const val CHUNK_OVERLAP = 200
         private const val DOWNLOAD_CONNECT_TIMEOUT_MS = 8000
         private const val DOWNLOAD_READ_TIMEOUT_MS = 12000
+        private const val VISION_MAX_WIDTH = 768
+        private const val VISION_MAX_HEIGHT = 1400
     }
 
-    private data class RawBubbleCandidate(
+    data class RawBubbleCandidate(
         val boundingBox: Rect,
         val bubbleBox: Rect,
         val cleanText: String
     )
+
+    sealed class PrepareResult {
+        data class Cached(val fileName: String) : PrepareResult()
+        object Empty : PrepareResult()
+        object Failed : PrepareResult()
+        data class Ready(
+            val bitmap: Bitmap,
+            val outFileName: String,
+            val bubbles: List<RawBubbleCandidate>,
+            val requests: List<ComicTranslator.TranslationRequest>,
+            val visionJpegBytes: ByteArray?
+        ) : PrepareResult()
+    }
 
     private val outputDir: File = File(context.cacheDir, "translated_panels").apply {
         if (!exists()) mkdirs()
@@ -94,9 +107,140 @@ class PanelImageTranslator(
     }
 
     /**
-     * Synchronously downloads, OCRs, translates, and bakes a comic panel image on a worker thread.
-     * Returns the cached file name if at least 1 speech bubble was translated, or "" if no text found,
-     * or null if download/decode failed.
+     * Stage 1 (Download + Decode + OCR + Optional Vision JPEG):
+     * Prepares a panel for either single-panel or cross-panel batch translation.
+     */
+    fun preparePanelForTranslation(
+        imageUrl: String,
+        pageUrl: String,
+        cookie: String?,
+        userAgent: String,
+        langIndex: Int,
+        bgStyle: Int,
+        textScale: Float,
+        isCancelled: () -> Boolean
+    ): PrepareResult {
+        if (isCancelled()) return PrepareResult.Failed
+
+        val engSig = TranslatorPrefs.getTranslationCacheSignature(context)
+        val cacheKey = sha256("$imageUrl|L=$langIndex|B=$bgStyle|S=$textScale|$engSig")
+        val outFileName = "panel_$cacheKey.jpg"
+        val outFile = File(outputDir, outFileName)
+        if (outFile.exists() && outFile.length() > 512) {
+            return PrepareResult.Cached(outFileName)
+        }
+
+        val rawBytes = fetchImageBytes(imageUrl, pageUrl, cookie, userAgent)
+            ?: return PrepareResult.Failed
+        if (isCancelled()) return PrepareResult.Failed
+
+        val bitmap = decodeOptimalPanelBitmap(rawBytes) ?: return PrepareResult.Failed
+        if (bitmap.width < 180 || bitmap.height < 140) {
+            bitmap.recycle()
+            return PrepareResult.Empty
+        }
+
+        if (isCancelled()) {
+            bitmap.recycle()
+            return PrepareResult.Failed
+        }
+
+        val candidates = runChunkedPanelOcr(bitmap, langIndex, isCancelled)
+        if (candidates == null) {
+            bitmap.recycle()
+            return PrepareResult.Failed
+        }
+        if (candidates.isEmpty()) {
+            bitmap.recycle()
+            return PrepareResult.Empty
+        }
+
+        val mergedBubbles = mergeSameBubbleCandidates(candidates)
+            .sortedWith(compareBy<RawBubbleCandidate> { it.bubbleBox.top / 160 }.thenBy { it.bubbleBox.left })
+        if (mergedBubbles.isEmpty()) {
+            bitmap.recycle()
+            return PrepareResult.Empty
+        }
+
+        val imgW = bitmap.width.coerceAtLeast(1).toFloat()
+        val imgH = bitmap.height.coerceAtLeast(1).toFloat()
+        val requests = mergedBubbles.map { item ->
+            val srcLang = comicTranslator.detectBubbleSourceLang(item.cleanText, langIndex)
+            val normBox = intArrayOf(
+                (item.bubbleBox.top * 1000f / imgH).roundToInt().coerceIn(0, 1000),
+                (item.bubbleBox.left * 1000f / imgW).roundToInt().coerceIn(0, 1000),
+                (item.bubbleBox.bottom * 1000f / imgH).roundToInt().coerceIn(0, 1000),
+                (item.bubbleBox.right * 1000f / imgW).roundToInt().coerceIn(0, 1000)
+            )
+            ComicTranslator.TranslationRequest(item.cleanText, srcLang, normBox)
+        }
+
+        val visionBytes = if (comicTranslator.isGeminiVisionReady()) {
+            encodeVisionJpeg(bitmap)
+        } else {
+            null
+        }
+
+        return PrepareResult.Ready(
+            bitmap = bitmap,
+            outFileName = outFileName,
+            bubbles = mergedBubbles,
+            requests = requests,
+            visionJpegBytes = visionBytes
+        )
+    }
+
+    /**
+     * Stage 2: Bakes translated texts onto [ready.bitmap], saves to disk cache, and recycles bitmap.
+     */
+    fun bakeAndSavePanel(
+        ready: PrepareResult.Ready,
+        translatedTexts: List<String?>,
+        bgStyle: Int,
+        textScale: Float,
+        isCancelled: () -> Boolean
+    ): String? {
+        val bitmap = ready.bitmap
+        try {
+            if (isCancelled()) return null
+
+            val blocksToBake = ArrayList<TranslatedBlock>(ready.bubbles.size)
+            for (i in ready.bubbles.indices) {
+                val trans = translatedTexts.getOrNull(i)
+                val bubble = ready.bubbles[i]
+                if (!trans.isNullOrBlank()) {
+                    blocksToBake.add(
+                        TranslatedBlock(
+                            boundingBox = bubble.boundingBox,
+                            translatedText = trans,
+                            bubbleBox = bubble.bubbleBox,
+                            originalText = bubble.cleanText
+                        )
+                    )
+                }
+            }
+
+            if (blocksToBake.isEmpty()) return ""
+
+            bakeTranslationsOntoBitmap(bitmap, blocksToBake, bgStyle, textScale)
+
+            val outFile = File(outputDir, ready.outFileName)
+            FileOutputStream(outFile).use { fos ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 88, fos)
+                fos.flush()
+            }
+            return ready.outFileName
+        } catch (_: Exception) {
+            return null
+        } finally {
+            if (!bitmap.isRecycled) {
+                bitmap.recycle()
+            }
+        }
+    }
+
+    /**
+     * Single-panel synchronous convenience wrapper.
      */
     fun translatePanelImageSync(
         imageUrl: String,
@@ -108,100 +252,45 @@ class PanelImageTranslator(
         textScale: Float,
         isCancelled: () -> Boolean
     ): String? {
-        if (isCancelled()) return null
-
-        val cacheKey = sha256("$imageUrl|L=$langIndex|B=$bgStyle|S=$textScale")
-        val outFileName = "panel_$cacheKey.jpg"
-        val outFile = File(outputDir, outFileName)
-        if (outFile.exists() && outFile.length() > 512) {
-            return outFileName
-        }
-
-        val rawBytes = fetchImageBytes(imageUrl, pageUrl, cookie, userAgent) ?: return null
-        if (isCancelled()) return null
-
-        val bitmap = decodeOptimalPanelBitmap(rawBytes) ?: return null
-        if (bitmap.width < 180 || bitmap.height < 140) {
-            bitmap.recycle()
-            return ""
-        }
-
-        if (isCancelled()) {
-            bitmap.recycle()
-            return null
-        }
-
-        val candidates = runChunkedPanelOcr(bitmap, langIndex, isCancelled)
-        if (candidates == null) {
-            bitmap.recycle()
-            return null
-        }
-        if (candidates.isEmpty()) {
-            bitmap.recycle()
-            return ""
-        }
-
-        val mergedBubbles = mergeSameBubbleCandidates(candidates)
-        if (mergedBubbles.isEmpty()) {
-            bitmap.recycle()
-            return ""
-        }
-
-        val requests = mergedBubbles.map { item ->
-            val srcLang = comicTranslator.detectBubbleSourceLang(item.cleanText, langIndex)
-            ComicTranslator.TranslationRequest(item.cleanText, srcLang)
-        }
-
-        var translatedTexts: List<String?> = emptyList()
-        val latch = CountDownLatch(1)
-        comicTranslator.translatePanelBatch(requests) { results ->
-            translatedTexts = results
-            latch.countDown()
-        }
-        try {
-            latch.await(12, TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {
-            bitmap.recycle()
-            return null
-        }
-
-        if (isCancelled()) {
-            bitmap.recycle()
-            return null
-        }
-
-        val blocksToBake = ArrayList<TranslatedBlock>(mergedBubbles.size)
-        for (i in mergedBubbles.indices) {
-            val trans = translatedTexts.getOrNull(i)
-            val bubble = mergedBubbles[i]
-            if (!trans.isNullOrBlank()) {
-                blocksToBake.add(
-                    TranslatedBlock(
-                        boundingBox = bubble.boundingBox,
-                        translatedText = trans,
-                        bubbleBox = bubble.bubbleBox,
-                        originalText = bubble.cleanText
-                    )
-                )
+        return when (val prep = preparePanelForTranslation(
+            imageUrl, pageUrl, cookie, userAgent, langIndex, bgStyle, textScale, isCancelled
+        )) {
+            is PrepareResult.Cached -> prep.fileName
+            is PrepareResult.Empty -> ""
+            is PrepareResult.Failed -> null
+            is PrepareResult.Ready -> {
+                val translated = comicTranslator.translateMultiPanelBatchSync(
+                    listOf(ComicTranslator.PanelBatchInput(prep.requests, prep.visionJpegBytes))
+                ).firstOrNull().orEmpty()
+                bakeAndSavePanel(prep, translated, bgStyle, textScale, isCancelled)
             }
         }
+    }
 
-        if (blocksToBake.isEmpty()) {
-            bitmap.recycle()
-            return ""
-        }
-
-        bakeTranslationsOntoBitmap(bitmap, blocksToBake, bgStyle, textScale)
-
+    private fun encodeVisionJpeg(bitmap: Bitmap): ByteArray? {
         return try {
-            FileOutputStream(outFile).use { fos ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 88, fos)
-                fos.flush()
+            val w = bitmap.width
+            val h = bitmap.height
+            val scale = minOf(
+                1f,
+                VISION_MAX_WIDTH.toFloat() / w.toFloat(),
+                VISION_MAX_HEIGHT.toFloat() / h.toFloat()
+            )
+            val scaled = if (scale < 0.99f) {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    (w * scale).roundToInt().coerceAtLeast(1),
+                    (h * scale).roundToInt().coerceAtLeast(1),
+                    true
+                )
+            } else {
+                bitmap
             }
-            bitmap.recycle()
-            outFileName
+            val bos = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 76, bos)
+            if (scaled !== bitmap) scaled.recycle()
+            bos.toByteArray()
         } catch (_: Exception) {
-            bitmap.recycle()
             null
         }
     }
@@ -254,7 +343,7 @@ class PanelImageTranslator(
                 var total = 0
                 while (input.read(buf).also { read = it } != -1) {
                     total += read
-                    if (total > 25 * 1024 * 1024) return null // Safety cap 25MB per single strip
+                    if (total > 25 * 1024 * 1024) return null
                     bos.write(buf, 0, read)
                 }
             }
@@ -313,10 +402,6 @@ class PanelImageTranslator(
         }
     }
 
-    /**
-     * Runs ML Kit OCR across the panel bitmap. If the panel is a tall vertical Webtoon strip,
-     * slices into overlapping vertical chunks so OCR maintains full crisp horizontal resolution.
-     */
     private fun runChunkedPanelOcr(
         bitmap: Bitmap,
         langIndex: Int,
@@ -414,7 +499,6 @@ class PanelImageTranslator(
     private fun mergeSameBubbleCandidates(items: List<RawBubbleCandidate>): List<RawBubbleCandidate> {
         if (items.size <= 1) return items
 
-        // First deduplicate near-identical boxes from overlapping Webtoon chunk boundaries
         val unique = ArrayList<RawBubbleCandidate>(items.size)
         for (cand in items) {
             val dupIdx = unique.indexOfFirst { existing ->
@@ -550,10 +634,6 @@ class PanelImageTranslator(
         return inter / minA
     }
 
-    /**
-     * Paints solid 100% pure white speech bubble patches + crisp bold Indonesian dialogue
-     * directly onto [bitmap] at image-proportional resolution.
-     */
     private fun bakeTranslationsOntoBitmap(
         bitmap: Bitmap,
         blocks: List<TranslatedBlock>,
@@ -563,7 +643,6 @@ class PanelImageTranslator(
         val canvas = Canvas(bitmap)
         val imgW = bitmap.width.toFloat()
         val imgH = bitmap.height.toFloat()
-        // Scale font metrics proportionally to panel pixel width (reference = 900px wide panel)
         val resScale = (imgW / 900f).coerceIn(0.55f, 1.5f) * userTextScale.coerceIn(0.75f, 1.35f)
 
         val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -683,7 +762,6 @@ class PanelImageTranslator(
             built.add(BakedItem(finalFillOwn, finalStrokeOwn, centeredX, centeredY, patch, radius))
         }
 
-        // Deduplicate stacking boxes inside the panel
         val sorted = built.sortedBy { it.patchRect.top }
         val cleanList = ArrayList<BakedItem>(sorted.size)
         for (cand in sorted) {
